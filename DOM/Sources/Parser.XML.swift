@@ -56,6 +56,16 @@ package struct XMLParser {
         var matcher: DOM.StyleSheet.Matcher?
     }
 
+    // parse errors met so far; only the first `maxLoggedErrors` are written to stderr
+    let errorLog = ErrorLog()
+
+    final class ErrorLog {
+        var count = 0
+
+        // a file of 60,000 invalid elements would otherwise spend seconds writing to stderr
+        static let maxLoggedErrors = 10
+    }
+
     // viewports and font-size that relative lengths of the element being parsed resolve against
     let lengthContext = LengthContext()
 

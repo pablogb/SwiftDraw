@@ -68,6 +68,10 @@ extension XMLParser {
     
     // CSS priority flag: `fill: red !important` is read as `fill: red`
     static func removingImportant(from value: String) -> String {
+      // every attribute value passes here (`d`, `data:` URLs): only one ending in `t` is searched
+      guard let last = value.utf8.last(where: { !isWhitespace($0) }), last == UInt8(ascii: "t") || last == UInt8(ascii: "T") else {
+        return value
+      }
       let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
       guard let range = trimmed.range(of: "important", options: [.caseInsensitive, .backwards]),
             range.upperBound == trimmed.endIndex else {
@@ -79,6 +83,10 @@ extension XMLParser {
         return value
       }
       return String(head[head.startIndex..<bang])
+    }
+
+    private static func isWhitespace(_ byte: UInt8) -> Bool {
+      byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D || byte == 0x0B || byte == 0x0C
     }
 
     func parse<T>(_ value: String?, with expression: (String) throws -> T, for key: String) throws -> T {

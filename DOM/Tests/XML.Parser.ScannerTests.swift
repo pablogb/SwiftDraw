@@ -254,6 +254,19 @@ struct ScannerTests {
     }
 
     @Test
+    func scanUnitOnlyReadsALetter() throws {
+        var scanner = XMLParser.Scanner(text: "1 px 2% 3")
+        var units = [DOM.Unit?]()
+        for _ in 0..<3 {
+            _ = try scanner.scanDouble()
+            units.append(scanner.scanUnit())
+            _ = scanner.scanStringIfPossible("%")
+        }
+        #expect(units == [.pixel, nil, nil])
+        #expect(scanner.isEOF)
+    }
+
+    @Test
     func scanUpToPreservesStrings() throws {
         var scanner = XMLParser.Scanner(text: #"foo: bar; baz: "bing;bob" zab;"#)
 

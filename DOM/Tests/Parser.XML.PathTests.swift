@@ -220,6 +220,25 @@ struct ParserXMLPathTests {
         #expect(path.segments[3] == .close)
         #expect(path.segments[4] == .move(x: 50, y: 60, space: .relative))
     }
+
+    @Test
+    func pathStopsAtAnImplicitCloseThatReadsNothing() throws {
+        // `Z` takes no numbers: repeating it implicitly once read nothing, forever
+        #expect(try XMLParser().parsePathSegments("M0 0Z!") == [move(0, 0, .absolute), .close])
+        #expect(try XMLParser().parsePathSegments("M0 0Z 5 5") == [move(0, 0, .absolute), .close])
+    }
+
+    @Test
+    func pathIsKeptUpToTheFirstError() throws {
+        // SVG 1.1 F.2
+        #expect(try XMLParser().parsePathSegments("M10 10 L20 20 L30") == [move(10, 10, .absolute), line(20, 20, .absolute)])
+        #expect(try XMLParser().parsePathSegments("M10 10 L20 20 # L5 5") == [move(10, 10, .absolute), line(20, 20, .absolute)])
+        #expect(try XMLParser().parsePathSegments("garbage") == [])
+
+        let svg = try DOM.SVG.parse(xml: #"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M0 0Z!" fill="blue"/></svg>"#)
+        let path = try #require(svg.childElements.first as? DOM.Path)
+        #expect(path.segments == [move(0, 0, .absolute), .close])
+    }
 }
 
 private func parseSegment(_ text: String) -> Segment? {

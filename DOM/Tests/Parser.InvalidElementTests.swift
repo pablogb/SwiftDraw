@@ -196,4 +196,37 @@ struct InvalidElementTests {
             try parse(#"<path/>"#, options: [])
         }
     }
+
+    @Test
+    func onlyTheFirstErrorsAreLogged() throws {
+        let filename = "log-cap-\(UUID().uuidString).svg"
+        let xml = #"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">"#
+            + String(repeating: "<rect/>", count: 60) + "</svg>"
+
+        let log = try capturingStandardError {
+            let parser = SwiftDrawDOM.XMLParser(options: [.skipInvalidElements], filename: filename)
+            _ = try parser.parseSVG(XML.SAXParser.parse(data: Data(xml.utf8)))
+        }
+
+        let lines = log.split(separator: "\n").filter { $0.contains(filename) }
+        #expect(lines.count == SwiftDrawDOM.XMLParser.ErrorLog.maxLoggedErrors + 1)
+        #expect(lines.prefix(10).allSatisfy { $0.contains("<rect>") })
+        #expect(lines.last?.hasSuffix("50 more errors not logged") == true)
+    }
+
+    private func capturingStandardError(_ body: () throws -> Void) throws -> String {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let file = try FileHandle(forWritingTo: url)
+        let saved = dup(STDERR_FILENO)
+        dup2(file.fileDescriptor, STDERR_FILENO)
+        defer {
+            dup2(saved, STDERR_FILENO)
+            close(saved)
+            try? file.close()
+        }
+        try body()
+        return try String(contentsOf: url, encoding: .utf8)
+    }
 }

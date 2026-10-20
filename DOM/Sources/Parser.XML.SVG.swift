@@ -33,8 +33,12 @@ import Foundation
 
 package extension XMLParser {
 
+    // a nested <svg> recurses through parseSVG with about 3 KB of stack (12 KB in a debug build):
+    // deeper ones are skipped so a 512 KB thread holds them. Real files nest two or three.
+    static let maxNestedSVGs = 16
+
     func parseSVG(_ e: XML.Element) throws -> DOM.SVG {
-        guard e.name == "svg" else {
+        guard e.name == "svg", lengthContext.viewports.count <= Self.maxNestedSVGs else {
             throw Error.invalid
         }
 
@@ -43,16 +47,21 @@ package extension XMLParser {
         let heightRaw = try? att.parseString("height")
         let viewBox: DOM.SVG.ViewBox? = try parseViewBox(try att.parseString("viewBox"))
 
-        // selectors are matched against the whole document tree before its elements are parsed
-        let styles = parseStyleSheetElements(within: e)
+        // selectors are matched against the whole document tree before its elements are parsed.
+        // The root's walkers already reach into nested <svg>s, so their own stylesheets and defs
+        // are read once, by the root: reading them again per level is exponential in the nesting.
         let isRoot = styleContext.matcher == nil
+        let styles = isRoot ? parseStyleSheetElements(within: e) : []
         if isRoot {
             styleContext.matcher = DOM.StyleSheet.Matcher(sheets: styles, root: e)
             lengthContext.viewports = []
             lengthContext.fontSize = rootFontSize(e)
         }
         defer {
-            if isRoot { styleContext.matcher = nil }
+            if isRoot {
+                styleContext.matcher = nil
+                logSkippedErrors()
+            }
         }
 
         let svg: DOM.SVG
@@ -105,7 +114,7 @@ package extension XMLParser {
         svg.viewBox = viewBox
         svg.preserveAspectRatio = parsePreserveAspectRatio(try? att.parseString("preserveAspectRatio"))
 
-        svg.defs = try parseSVGDefs(e)
+        svg.defs = isRoot ? try parseSVGDefs(e) : DOM.SVG.Defs()
         svg.styles = styles
 
         // attributes and style="" stay separate so stylesheet rules fall between them

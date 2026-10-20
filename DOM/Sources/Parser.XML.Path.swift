@@ -62,12 +62,17 @@ package extension XMLParser {
 
         var lastCommand: Command?
 
+        // SVG 1.1 F.2: the path is drawn up to the first error in its data. A segment that reads
+        // nothing (an implicit `Z` repeated before `!`) is an error too, or the loop would never end.
         repeat {
-            guard let cmd = nextPathCommand(&scanner, lastCommand: lastCommand) else {
-                throw Error.invalid
+            let start = scanner.currentIndex
+            guard let cmd = nextPathCommand(&scanner, lastCommand: lastCommand),
+                  let segment = try? parsePathSegment(for: cmd, with: &scanner),
+                  scanner.currentIndex != start else {
+                break
             }
             lastCommand = cmd
-            segments.append(try parsePathSegment(for: cmd, with: &scanner))
+            segments.append(segment)
         } while !scanner.isAtEnd
 
         return segments

@@ -159,6 +159,10 @@ package extension DOM.StyleSheet.ComplexSelector {
         return result.isEmpty ? nil : result
     }
 
+    // matching recurses once per compound: a longer selector is dropped so it cannot exhaust
+    // the 512 KB stack of a background thread (no real stylesheet comes near 32)
+    static let maxCompounds = 32
+
     static func parse(_ text: String) -> Self? {
         var s = SelectorScanner(text)
         var compounds = [Compound]()
@@ -178,7 +182,7 @@ package extension DOM.StyleSheet.ComplexSelector {
                     return nil
                 }
             }
-            guard let compound = s.scanCompound() else { return nil }
+            guard let compound = s.scanCompound(), compounds.count < maxCompounds else { return nil }
             compounds.append(compound)
         }
 
@@ -433,6 +437,11 @@ package extension DOM.StyleSheet {
         // compound selector tests, memo hits and ancestor / sibling walk steps, for performance tests
         package private(set) var evaluations = 0
 
+        // about 1 s of matching (0.4–0.7 µs each); past it no further rule is tried, which also
+        // bounds the memo (one entry per evaluation at most). A 10,000-cell grid styled by a dozen
+        // rules, descendant and sibling ones included, uses a quarter of it.
+        package var evaluationBudget = 2_000_000
+
         private struct MemoKey: Hashable {
             var rule: Int
             var compound: Int
@@ -480,7 +489,7 @@ package extension DOM.StyleSheet {
         package var isEmpty: Bool { selectors.isEmpty }
 
         package func match(_ element: XML.Element) -> Matched? {
-            guard !selectors.isEmpty else { return nil }
+            guard !selectors.isEmpty, evaluations < evaluationBudget else { return nil }
 
             var candidates = universal
             candidates += byType[element.name] ?? []
@@ -492,7 +501,7 @@ package extension DOM.StyleSheet {
             }
 
             let matching = Set(candidates)
-                .filter { matches(rule: $0, at: selectors[$0].compounds.count - 1, element) }
+                .filter { evaluations < evaluationBudget && matches(rule: $0, at: selectors[$0].compounds.count - 1, element) }
                 .sorted { l, r in
                     specificities[l] == specificities[r] ? l < r : specificities[l] < specificities[r]
                 }
@@ -541,7 +550,7 @@ package extension DOM.StyleSheet {
             var walked = [ObjectIdentifier]()
             var current = element
             var result = false
-            while let candidate = next(current) {
+            while evaluations < evaluationBudget, let candidate = next(current) {
                 evaluations += 1
                 let key = MemoKey(rule: rule, compound: i, kind: kind, element: ObjectIdentifier(current))
                 if let known = memo[key] {

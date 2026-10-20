@@ -273,6 +273,11 @@ package extension XMLParser {
         }
 
         package mutating func scanUnit() -> DOM.Unit? {
+            // every unit starts with a letter: most numbers (no unit, or at the end) skip the 8 probes
+            guard let next = scanner.string.unicodeScalars[currentIndex...].first(where: { !CharacterSet.whitespacesAndNewlines.contains($0) }),
+                  CharacterSet.letters.contains(next) else {
+                return nil
+            }
             if scanUnit(.pixel) {
                 return .pixel
             } else if scanUnit(.inch) {

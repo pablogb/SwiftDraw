@@ -124,4 +124,43 @@ struct SAXParserTests {
         #expect(root.children[0].innerText?.contains("kept") == true)
         #expect(root.innerText?.contains("dropped") != true)
     }
+
+    @Test
+    func entitiesAreJoinedIntoTheText() throws {
+        let xml = "<svg xmlns=\"http://www.w3.org/2000/svg\"><desc>a" + String(repeating: "&lt;b", count: 10_000) + "</desc></svg>"
+        let root = try XML.SAXParser.parse(data: Data(xml.utf8))
+        #expect(root.children[0].innerText == "a" + String(repeating: "<b", count: 10_000))
+    }
+
+    @Test
+    func elementsNestedTooDeepAreSkipped() throws {
+        let depth = 5_000
+        let xml = #"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">"#
+            + String(repeating: #"<g><rect width="1" height="1"/>"#, count: depth - 1)
+            + String(repeating: "</g>", count: depth - 1) + "</svg>"
+
+        nonisolated(unsafe) var root: XML.Element?
+        nonisolated(unsafe) var svg: DOM.SVG?
+        let done = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            root = try? XML.SAXParser.parse(data: Data(xml.utf8))
+            svg = try? DOM.SVG.parse(xml: xml)
+            done.signal()
+        }
+        thread.stackSize = 512 * 1024
+        thread.start()
+        #expect(done.wait(timeout: .now() + 60) == .success)
+
+        var levels = 0
+        var element = try #require(root)
+        while true {
+            levels += 1
+            guard let g = element.children.first(where: { $0.name == "g" }) else { break }
+            element = g
+        }
+        #expect(levels == XML.SAXParser.maxDepth)
+        // the last level kept is a <g> without its children
+        #expect(element.children.isEmpty)
+        #expect(svg != nil)
+    }
 }

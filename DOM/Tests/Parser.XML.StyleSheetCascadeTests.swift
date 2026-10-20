@@ -547,4 +547,83 @@ struct ParserXMLStyleSheetCascadeTests {
         // without the memo every rect walks up all its ancestors (~125 k)
         #expect(m.evaluations < 3 * elements.count)
     }
+
+    @Test
+    func selectorOfMoreThan32CompoundsIsDropped() throws {
+        let chain = { (n: Int) in Array(repeating: "*", count: n).joined(separator: " ~ ") }
+        #expect(Selector.parse(chain(Selector.maxCompounds))?.compounds.count == 32)
+        #expect(Selector.parse(chain(Selector.maxCompounds + 1)) == nil)
+    }
+
+    @Test
+    func longSiblingChainFitsASmallThreadStack() throws {
+        // matching recurses once per compound: 1,200 of them overflowed a 512 KB stack
+        let siblings = String(repeating: "<g/>", count: 1_200)
+        let parse = { (compounds: Int) -> DOM.SVG? in
+            let selector = Array(repeating: "*", count: compounds).joined(separator: "~")
+            nonisolated(unsafe) var svg: DOM.SVG?
+            let done = DispatchSemaphore(value: 0)
+            let thread = Thread {
+                svg = try? DOM.SVG.parse(xml: """
+                <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+                <style>\(selector) { fill: red }</style>\(siblings)
+                </svg>
+                """)
+                done.signal()
+            }
+            thread.stackSize = 512 * 1024
+            thread.start()
+            #expect(done.wait(timeout: .now() + 60) == .success)
+            return svg
+        }
+
+        let dropped = try #require(parse(1_200))
+        #expect(dropped.childElements.allSatisfy { $0.matchedStyle?.attributes.fill == nil })
+
+        let kept = try #require(parse(Selector.maxCompounds))
+        // <style> is the first sibling
+        #expect(kept.childElements[29].matchedStyle?.attributes.fill == nil)
+        #expect(kept.childElements[30].matchedStyle?.attributes.fill == .color(.keyword(.red)))
+    }
+
+    @Test
+    func matchingStopsAtTheEvaluationBudget() throws {
+        let rules = String(repeating: "* { fill: red } ", count: 100)
+        let body = String(repeating: "<g/>", count: 1_000)
+        let (m, root) = try matcher(style: rules, body: body)
+        m.evaluationBudget = 10_000
+        let results = root.children.map { m.match($0) }
+        // 100 candidates each: the first 99 <g> (after the root) are matched, the rest are not
+        #expect(results[0..<99].allSatisfy { $0?.attributes.fill == .color(.keyword(.red)) })
+        #expect(results[100...].allSatisfy { $0 == nil })
+        #expect(m.evaluations <= m.evaluationBudget)
+    }
+
+    @Test
+    func siblingChainMemoStopsAtTheBudget() throws {
+        // `*+*+…` over as many siblings grows work and memo as n × k
+        let selector = Array(repeating: "*", count: Selector.maxCompounds).joined(separator: "+")
+        let body = String(repeating: "<g/>", count: 5_000)
+        let (m, root) = try matcher(style: "\(selector) { fill: red }", body: body)
+        m.evaluationBudget = 50_000
+        for e in allElements(root) { _ = m.match(e) }
+        // a walk in progress may finish its current step after the budget is met
+        #expect(m.evaluations <= m.evaluationBudget + Selector.maxCompounds)
+    }
+
+    @Test
+    func aStyledGridStaysWellInsideTheBudget() throws {
+        let rules = """
+        * { stroke-width: 1 } g { fill: none } rect { stroke: black } text { fill: black }
+        .row .cell rect { fill: white } .cell > text { font-size: 12px } .cell.given text { fill: blue }
+        .row:first-child .cell rect { stroke-width: 2 } .cell:first-child rect { stroke-width: 2 }
+        .row + .row .cell rect { stroke: gray } .cell ~ .cell text { fill: gray } #board .row text.n { fill: red }
+        """
+        let cell = #"<g class="cell"><rect class="bg"/><text class="n">1</text></g>"#
+        let row = #"<g class="row">"# + String(repeating: cell, count: 100) + "</g>"
+        let (m, root) = try matcher(style: rules, body: #"<g id="board">"# + String(repeating: row, count: 100) + "</g>")
+        for e in allElements(root) { _ = m.match(e) }
+        // 10,000 cells, 30,000 elements: about 490,000 evaluations
+        #expect(m.evaluations < m.evaluationBudget / 3)
+    }
 }

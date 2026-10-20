@@ -48,9 +48,14 @@ package extension XML {
         private let validNamespaces = Set(["http://www.w3.org/2000/svg", ""])
 
         private var rootNode: Element?
-        /// Nesting depth inside an element from a foreign namespace (`<inkscape:foo>`); its whole subtree is dropped.
+        /// Nesting depth inside an element from a foreign namespace (`<inkscape:foo>`), or nested too deep; its whole subtree is dropped.
         private var foreignDepth = 0
         private var elements: [Element]
+
+        // the walkers of both the parser and the renderer recurse once per level: deeper elements
+        // are skipped with their subtree so they fit the 512 KB stack of a background thread
+        package static let maxDepth = 256
+        private var loggedDepth = false
 
         private var currentElement: Element {
             return elements.last!
@@ -96,6 +101,14 @@ package extension XML {
                 foreignDepth += 1
                 return
             }
+            guard elements.count < Self.maxDepth else {
+                foreignDepth += 1
+                if !loggedDepth {
+                    loggedDepth = true
+                    StandardErrorStream().write("[parsing error] line: \(parser.lineNumber) elements nested deeper than \(Self.maxDepth) levels skipped\n")
+                }
+                return
+            }
 
             let element = Element(name: elementName, attributes: attributeDict)
             element.parsedLocation = (line: parser.lineNumber, column: parser.columnNumber)
@@ -122,8 +135,12 @@ package extension XML {
 
         package func parser(_ parser: FoundationXMLParser, foundCharacters string: String) {
             guard foreignDepth == 0, let element = elements.last else { return }
-            let text = element.innerText.map { $0.appending(string) }
-            element.innerText = text ?? string
+            // in place: NSXMLParser reports each entity (`&lt;`) as its own string
+            if element.innerText == nil {
+                element.innerText = string
+            } else {
+                element.innerText?.append(string)
+            }
         }
     }
 }

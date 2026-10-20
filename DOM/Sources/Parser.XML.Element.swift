@@ -32,11 +32,12 @@
 extension XMLParser {
 
     func parseLine(_ att: any AttributeParser) throws -> DOM.Line {
-        let x1: DOM.Coordinate = try parseLength(att, "x1", .horizontal)
-        let y1: DOM.Coordinate = try parseLength(att, "y1", .vertical)
-        let x2: DOM.Coordinate = try parseLength(att, "x2", .horizontal)
-        let y2: DOM.Coordinate = try parseLength(att, "y2", .vertical)
-        return DOM.Line(x1: x1, y1: y1, x2: x2, y2: y2)
+        // SVG 1.1 §9.5: a missing coordinate is 0 (SVGO strips `x1="0"`)
+        let x1: DOM.Coordinate? = try parseLength(att, "x1", .horizontal)
+        let y1: DOM.Coordinate? = try parseLength(att, "y1", .vertical)
+        let x2: DOM.Coordinate? = try parseLength(att, "x2", .horizontal)
+        let y2: DOM.Coordinate? = try parseLength(att, "y2", .vertical)
+        return DOM.Line(x1: x1 ?? 0, y1: y1 ?? 0, x2: x2 ?? 0, y2: y2 ?? 0)
     }
 
     func parseCircle(_ att: any AttributeParser) throws -> DOM.Circle {
@@ -186,7 +187,7 @@ extension XMLParser {
 
     func parseError(for error: any Swift.Error, parsing element: XML.Element, with options: Options) -> XMLParser.Error? {
         guard options.contains(.skipInvalidElements) == false else {
-            Self.logParsingError(for: error, filename: filename, parsing: element)
+            logParsingError(for: error, parsing: element)
             return nil
         }
 
@@ -424,28 +425,47 @@ extension XMLParser {
         )
     }
 
+    func logParsingError(for error: any Swift.Error, parsing element: XML.Element) {
+        errorLog.count += 1
+        guard errorLog.count <= ErrorLog.maxLoggedErrors else { return }
+        Self.logParsingError(for: error, filename: filename, parsing: element)
+    }
+
+    // the line that ends a parse which met more errors than it logged
+    func logSkippedErrors() {
+        defer { errorLog.count = 0 }
+        let skipped = errorLog.count - ErrorLog.maxLoggedErrors
+        guard skipped > 0 else { return }
+        var line = ""
+        print("[parsing error]", filename ?? "", "\(skipped) more errors not logged", to: &line)
+        StandardErrorStream().write(line)
+    }
+
     package static func logParsingError(for error: any Swift.Error, filename: String?, parsing element: XML.Element? = nil) {
         let elementName = element.map { "<\($0.name)>" } ?? ""
         let filename = filename ?? ""
+        // built first and written once: print(to: &.standardError) makes a write(2) per item
+        var message = ""
+        defer { StandardErrorStream().write(message) }
         switch error {
         case let XMLParser.Error.invalidDocument(error, element, line, column):
             let element = element.map { "<\($0)>" } ?? ""
             if let error = error {
-                print("[parsing error]", filename, element, "line:", line, "column:", column, "error:", error, to: &.standardError)
+                print("[parsing error]", filename, element, "line:", line, "column:", column, "error:", error, to: &message)
             } else {
-                print("[parsing error]", filename, element, "line:", line, "column:", column, to: &.standardError)
+                print("[parsing error]", filename, element, "line:", line, "column:", column, to: &message)
             }
         case let XMLParser.Error.invalidElement(name, error, line, column):
             if let line = line {
-                print("[parsing error]", filename, "<\(name)>", "line:", line, "column:", column ?? -1, "error:", error, to: &.standardError)
+                print("[parsing error]", filename, "<\(name)>", "line:", line, "column:", column ?? -1, "error:", error, to: &message)
             } else {
-                print("[parsing error]", filename, "<\(name)>", "error:", error, to: &.standardError)
+                print("[parsing error]", filename, "<\(name)>", "error:", error, to: &message)
             }
         default:
             if let location = element?.parsedLocation {
-                print("[parsing error]", filename, elementName, "line:", location.line, "column:", location.column, "error:", error, to: &.standardError)
+                print("[parsing error]", filename, elementName, "line:", location.line, "column:", location.column, "error:", error, to: &message)
             } else {
-                print("[parsing error]", filename, elementName, "error:", error, to: &.standardError)
+                print("[parsing error]", filename, elementName, "error:", error, to: &message)
             }
         }
     }

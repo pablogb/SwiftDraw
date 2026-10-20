@@ -51,7 +51,7 @@ extension XMLParser {
             do {
                 try sheets.append(parseStyleSheetElement(e.innerText))
             } catch {
-                Self.logParsingError(for: error, filename: filename, parsing: e)
+                logParsingError(for: error, parsing: e)
             }
         }
 

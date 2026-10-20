@@ -243,6 +243,11 @@ struct TolerantParsingTests {
         #expect(A.removingImportant(from: "red !IMPORTANT") == "red ")
         #expect(A.removingImportant(from: "important") == "important")
         #expect(A.removingImportant(from: "red") == "red")
+        #expect(A.removingImportant(from: "red !important \n\t") == "red ")
+        #expect(A.removingImportant(from: "red !Important") == "red ")
+        #expect(A.removingImportant(from: "M0 0h1important") == "M0 0h1important")
+        #expect(A.removingImportant(from: "") == "")
+        #expect(A.removingImportant(from: " \n") == " \n")
     }
 
     @Test

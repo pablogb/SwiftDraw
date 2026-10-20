@@ -46,6 +46,13 @@ struct XMLParserElementTests {
     }
 
     @Test
+    func lineCoordinatesDefaultToZero() throws {
+        #expect(try XMLParser().parseLine(["x2": "10", "y2": "20"]) == DOM.Line(x1: 0, y1: 0, x2: 10, y2: 20))
+        #expect(try XMLParser().parseLine([:]) == DOM.Line(x1: 0, y1: 0, x2: 0, y2: 0))
+        #expect(throws: (any Error).self) { try XMLParser().parseLine(["x1": "a"]) }
+    }
+
+    @Test
     func circle() {
         let node = ["cx": "0",
                     "cy": "10",

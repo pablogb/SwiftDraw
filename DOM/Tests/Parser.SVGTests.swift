@@ -31,6 +31,8 @@
 
 
 @testable import SwiftDrawDOM
+import Dispatch
+import class Foundation.Thread
 import Testing
 
 struct ParserSVGTests {
@@ -367,5 +369,74 @@ struct ParserSVGTests {
         await #expect(throws: CancellationError.self) {
             try await task.value
         }
+    }
+
+    @Test
+    func nestedSVGDefsAndStylesAreReadOnceByTheRoot() throws {
+        let svg = try DOM.SVG.parse(xml: #"""
+            <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+              <svg id="outer"><svg id="inner">
+                <style>.s { fill: red }</style>
+                <defs>
+                  <linearGradient id="lg"><stop offset="0" stop-color="red"/></linearGradient>
+                  <pattern id="p" width="1" height="1"><rect width="1" height="1"/></pattern>
+                  <clipPath id="c"><rect width="1" height="1"/></clipPath>
+                  <mask id="m"><rect width="1" height="1"/></mask>
+                  <filter id="f"><feGaussianBlur stdDeviation="1"/></filter>
+                  <rect id="d" width="1" height="1"/>
+                </defs>
+                <rect id="r" class="s" width="1" height="1" fill="url(#lg)" clip-path="url(#c)" mask="url(#m)" filter="url(#f)"/>
+              </svg></svg>
+              <rect id="o" class="s" width="1" height="1"/>
+            </svg>
+            """#)
+
+        // the root's walkers reach every nested <svg>: each def is found there, once
+        #expect(svg.defs.linearGradients.map(\.id) == ["lg"])
+        #expect(svg.defs.patterns.map(\.id) == ["p"])
+        #expect(svg.defs.clipPaths.map(\.id) == ["c"])
+        #expect(svg.defs.masks.map(\.id) == ["m"])
+        #expect(svg.defs.filters.map(\.id) == ["f"])
+        #expect(svg.defs.elements.keys.sorted() == ["d"])
+        #expect(svg.styles.count == 1)
+
+        let outer = try #require(svg.childElements.first as? DOM.SVG)
+        let inner = try #require(outer.childElements.first as? DOM.SVG)
+        for nested in [outer, inner] {
+            #expect(nested.defs.linearGradients.isEmpty && nested.defs.patterns.isEmpty && nested.defs.clipPaths.isEmpty)
+            #expect(nested.defs.masks.isEmpty && nested.defs.filters.isEmpty && nested.defs.elements.isEmpty)
+            #expect(nested.styles.isEmpty)
+        }
+
+        // a rule inside a nested <svg> applies to the whole document
+        #expect(svg.firstGraphicsElement(with: "r")?.matchedStyle?.attributes.fill == .color(.keyword(.red)))
+        #expect(svg.firstGraphicsElement(with: "o")?.matchedStyle?.attributes.fill == .color(.keyword(.red)))
+    }
+
+    @Test
+    func svgNestedTooDeepIsSkipped() throws {
+        let depth = 5_000
+        let xml = #"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">"#
+            + String(repeating: #"<svg><rect width="1" height="1"/>"#, count: depth)
+            + String(repeating: "</svg>", count: depth) + "</svg>"
+
+        nonisolated(unsafe) var svg: DOM.SVG?
+        let done = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            svg = try? DOM.SVG.parse(xml: xml)
+            done.signal()
+        }
+        thread.stackSize = 512 * 1024
+        thread.start()
+        #expect(done.wait(timeout: .now() + 60) == .success)
+
+        var nested = 0
+        var element = try #require(svg)
+        while let child = element.childElements.first(where: { $0 is DOM.SVG }) as? DOM.SVG {
+            nested += 1
+            element = child
+        }
+        #expect(nested == SwiftDrawDOM.XMLParser.maxNestedSVGs)
+        #expect(element.childElements.count == 1)
     }
 }
