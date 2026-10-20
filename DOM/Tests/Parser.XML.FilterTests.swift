@@ -85,6 +85,15 @@ struct ParserXMLFilterTests {
     }
 
     @Test
+    func parseBlurMoreThanTwoValuesIsZero() throws {
+        let element = XML.Element.makeMockFilter()
+        element.children = [.makeElement("feGaussianBlur", ["stdDeviation": "5 10 15 20"])]
+
+        let filter = try XMLParser().parseFilter(element)
+        #expect(filter.effects == [.gaussianBlur(stdDeviation: 0)])
+    }
+
+    @Test
     func parseRegionAndUnits() throws {
         let element = XML.Element(name: "filter", attributes: [
             "id": "f",
@@ -166,11 +175,13 @@ struct ParserXMLFilterTests {
         element.children = [
             .makeElement("feOffset", ["dx": "2", "dy": "-3.5", "in": "SourceAlpha", "result": "o"]),
             .makeElement("feOffset", ["dy": "4"]),
-            .makeElement("feOffset", ["dx": "abc", "dy": "1e60"])
+            .makeElement("feOffset", ["dx": "abc", "dy": "1e60"]),
+            .makeElement("feOffset", ["dx": "20%", "dy": " 5 "])
         ]
 
         let filter = try XMLParser().parseFilter(element)
-        #expect(filter.effects == [.offset(dx: 2, dy: -3.5), .offset(dx: 0, dy: 4), .offset(dx: 0, dy: 0)])
+        #expect(filter.effects == [.offset(dx: 2, dy: -3.5), .offset(dx: 0, dy: 4), .offset(dx: 0, dy: 0),
+                                   .offset(dx: 0, dy: 5)])
         #expect(filter.primitives[0].inputs == [.sourceAlpha])
         #expect(filter.primitives[1].inputs == [nil])
     }
@@ -371,7 +382,7 @@ struct ParserXMLFilterTests {
             .composite(.over),
             .blend(.normal),
             .colorMatrix(.matrix([1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0])),
-            .offset(dx: 0, dy: 1)
+            .offset(dx: 0, dy: 0)
         ])
         #expect(filter.primitives[1].inputs == [nil, nil])
         #expect(svg.childElements.count == 1)

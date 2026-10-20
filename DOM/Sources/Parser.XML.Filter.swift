@@ -139,8 +139,8 @@ extension XMLParser {
         switch e.name {
         case "feGaussianBlur":
             let att: any AttributeParser = try parseAttributes(e)
-            // SVG 1.1 §15.17: one or two numbers; missing, invalid or negative values disable the blur
-            let values: [DOM.Float] = (try? att.parseFloats("stdDeviation")) ?? []
+            // SVG 1.1 §15.17: one or two numbers; missing, invalid or negative values, or more than two, disable the blur
+            let values: [DOM.Float] = (try? att.parseFloats("stdDeviation")).flatMap { $0.count <= 2 ? $0 : nil } ?? []
             let x = values.first ?? 0
             let y = values.count > 1 ? values[1] : nil
             return .gaussianBlur(stdDeviation: x, stdDeviationY: y)
@@ -259,8 +259,11 @@ extension XMLParser {
         return DOM.Filter.ColorInterpolation(rawValue: Attributes.removingImportant(from: value).trimmingCharacters(in: .whitespaces))
     }
 
+    /// A <number>: the whole value, so `20%` or `5px` is invalid and takes the default.
     func parseFiniteFloat(_ att: any AttributeParser, _ key: String) -> DOM.Float? {
-        guard let value = try? att.parseFloat(key), value.isFinite else { return nil }
+        guard let raw: String = try? att.parseString(key),
+              let value = DOM.Float(raw.trimmingCharacters(in: .whitespaces)),
+              value.isFinite else { return nil }
         return value
     }
 }
