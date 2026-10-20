@@ -104,6 +104,7 @@ extension LayerTree {
         var cap: LineCap
         var join: LineJoin
         var miterLimit: Float
+        var dash: [Float] = []
 
         enum Stroke: Hashable {
             case color(Color)

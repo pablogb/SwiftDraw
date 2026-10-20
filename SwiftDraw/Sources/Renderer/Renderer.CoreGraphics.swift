@@ -402,6 +402,10 @@ struct CGRenderer: Renderer {
         ctx.setMiterLimit(miterLimit)
     }
 
+    func setLineDash(lengths: [CGFloat]) {
+        ctx.setLineDash(phase: 0, lengths: lengths)
+    }
+
     func setClip(path: CGPath, rule: CGPathFillRule) {
         ctx.addPath(path)
         ctx.clip(using: rule)

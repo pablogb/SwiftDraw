@@ -165,6 +165,20 @@ final class LayerTreeBuilderTests: XCTestCase {
     XCTAssertEqual(att2.color, .none)
   }
 
+  func testStrokeDash() {
+    var state = LayerTree.Builder.State()
+    XCTAssertEqual(LayerTree.Builder.makeStrokeAttributes(with: state).dash, [])
+
+    state.strokeDashArray = [3.8, 3.8]
+    XCTAssertEqual(LayerTree.Builder.makeStrokeAttributes(with: state).dash, [3.8, 3.8])
+
+    state.strokeDashArray = [0, 0]
+    XCTAssertEqual(LayerTree.Builder.makeStrokeAttributes(with: state).dash, [])
+
+    state.strokeDashArray = [4, -1]
+    XCTAssertEqual(LayerTree.Builder.makeStrokeAttributes(with: state).dash, [])
+  }
+
   func testDeepNestedSVGBuildLayers() async {
     let circle = DOM.Circle(cx: 50, cy: 50, r: 10)
     let svg = DOM.SVG(width: 50, height: 50)

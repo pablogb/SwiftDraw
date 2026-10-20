@@ -87,6 +87,12 @@ extension LayerTree {
                 } else {
                     return nil
                 }
+            case .setLineDash(let lengths):
+                if state.top.lineDash != lengths {
+                    state.top.lineDash = lengths
+                } else {
+                    return nil
+                }
             case .setBlend(mode: let mode):
                 if state.top.blendMode != mode {
                     state.top.blendMode = mode
@@ -133,6 +139,7 @@ extension LayerTree {
             var lineJoin: T.LineJoin?
             var lineWidth: T.Float?
             var lineMiter: T.Float?
+            var lineDash: [T.Float] = []
             var blendMode: T.BlendMode?
         }
     }

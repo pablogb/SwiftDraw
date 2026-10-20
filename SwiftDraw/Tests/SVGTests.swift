@@ -121,6 +121,24 @@ struct SVGTests {
 #endif
 
     @Test
+    func strokeDashArrayLeavesGaps() throws {
+        let svg = try #require(SVG(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="40" height="10">
+          <line x1="0" y1="5" x2="40" y2="5" stroke="black" stroke-width="4" stroke-dasharray="10 10"/>
+        </svg>
+        """))
+        let ctx = try #require(CGContext(data: nil, width: 40, height: 10, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpaceCreateDeviceRGB(),
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.draw(svg, in: CGRect(x: 0, y: 0, width: 40, height: 10))
+        let pixels = try #require(ctx.data).assumingMemoryBound(to: UInt8.self)
+        let alpha = { (x: Int) in pixels[5 * ctx.bytesPerRow + x * 4 + 3] }
+        #expect(alpha(5) == 255)
+        #expect(alpha(15) == 0)
+        #expect(alpha(25) == 255)
+    }
+
+    @Test
     func size() {
         let image = SVG.makeLines()
 

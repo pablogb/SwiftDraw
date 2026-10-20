@@ -268,6 +268,7 @@ extension LayerTree {
                 commands.append(.setLineJoin(join))
                 commands.append(.setLine(width: width))
                 commands.append(.setLineMiter(limit: limit))
+                commands.append(.setLineDash(stroke.dash.map { provider.createFloat(from: $0) }))
                 commands.append(.setStroke(color: color))
                 commands.append(.stroke(path))
             case .linearGradient(let gradient):
@@ -282,6 +283,7 @@ extension LayerTree {
                     commands.append(.setLineJoin(join))
                     commands.append(.setLine(width: width))
                     commands.append(.setLineMiter(limit: limit))
+                    commands.append(.setLineDash(stroke.dash.map { provider.createFloat(from: $0) }))
                     commands.append(.clipStrokeOutline(path))
 
                     commands.append(contentsOf: renderCommands(forLinear: gradient,
@@ -302,6 +304,7 @@ extension LayerTree {
                     commands.append(.setLineJoin(join))
                     commands.append(.setLine(width: width))
                     commands.append(.setLineMiter(limit: limit))
+                    commands.append(.setLineDash(stroke.dash.map { provider.createFloat(from: $0) }))
                     commands.append(.clipStrokeOutline(path))
 
                     commands.append(contentsOf: renderCommands(forRadial: gradient,

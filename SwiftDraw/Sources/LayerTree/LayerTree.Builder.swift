@@ -248,7 +248,14 @@ extension LayerTree.Builder {
                                           width: state.strokeWidth,
                                           cap: state.strokeLineCap,
                                           join: state.strokeLineJoin,
-                                          miterLimit: state.strokeLineMiterLimit)
+                                          miterLimit: state.strokeLineMiterLimit,
+                                          dash: Self.makeDash(state.strokeDashArray))
+    }
+
+    // SVG: a negative length disables dashing; all zeros draws solid.
+    static func makeDash(_ lengths: [DOM.Float]) -> [LayerTree.Float] {
+        guard lengths.allSatisfy({ $0 >= 0 }), lengths.contains(where: { $0 > 0 }) else { return [] }
+        return lengths.map { LayerTree.Float($0) }
     }
 
     func makeFillAttributes(with state: State) -> LayerTree.FillAttributes {
