@@ -207,6 +207,12 @@ extension XMLParser {
     guard scanner.scanStringIfPossible("#") else { return nil }
     let hexadecimal = Foundation.CharacterSet(charactersIn: "0123456789ABCDEFabcdef")
     let code = try scanner.scanString(matchingAny: hexadecimal)
+    if code.count == 4 || code.count == 8 {
+      let digits = code.count == 4 ? code.map { "\($0)\($0)" }.joined() : code
+      guard let value = UInt32(digits, radix: 16) else { throw Error.invalid }
+      return .rgbi(UInt8((value >> 24) & 0xff), UInt8((value >> 16) & 0xff), UInt8((value >> 8) & 0xff),
+                   DOM.Float(value & 0xff) / 255)
+    }
     guard
       let paddedCode = padHex(code),
       let hex = Int(paddedCode, radix: 16) else {

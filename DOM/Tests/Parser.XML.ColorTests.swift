@@ -103,6 +103,9 @@ struct ParserColorTests {
         #expect(try XMLParser().parseColor("#a06") == .hex(170, 0, 102))
         #expect(try XMLParser().parseColor("#123456") == .hex(18, 52, 86))
         #expect(try XMLParser().parseColor("#FF11DD") == .hex(255, 17, 221))
+        #expect(try XMLParser().parseColor("#a068") == .rgbi(170, 0, 102, 136.0 / 255))
+        #expect(try XMLParser().parseColor("#b5d8feff") == .rgbi(181, 216, 254, 1))
+        #expect(try XMLParser().parseColor("#ffffff00") == .rgbi(255, 255, 255, 0))
         #expect(throws: (any Error).self) {
             try XMLParser().parseColor("#invalid")
         }
