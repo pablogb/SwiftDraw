@@ -1,6 +1,7 @@
-> **This is an altered version of [SwiftDraw](https://github.com/swhitty/SwiftDraw) by Simon Whitty**, maintained by
-> Misoservices for Backdrop. It renders SVG features the original drops; the changes are listed in
-> [Backdrop/ROADMAP.md](Backdrop/ROADMAP.md). Licence unchanged: zlib, see [LICENSE.txt](LICENSE.txt).
+> **This is an altered version of [SwiftDraw](https://github.com/swhitty/SwiftDraw) by Simon Whitty**,
+> kept for Atamatsugi Studio on the `atamatsugi` branch. It includes Misoservices' changes from
+> [swhitty/SwiftDraw#142](https://github.com/swhitty/SwiftDraw/pull/142) and fixes of its own.
+> Licence unchanged: zlib, see [LICENSE.txt](LICENSE.txt).
 
 [![Build](https://github.com/swhitty/SwiftDraw/actions/workflows/build.yml/badge.svg)](https://github.com/swhitty/SwiftDraw/actions/workflows/build.yml)
 [![CodeCov](https://codecov.io/gh/swhitty/SwiftDraw/graphs/badge.svg)](https://codecov.io/gh/swhitty/SwiftDraw)
