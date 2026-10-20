@@ -79,6 +79,21 @@ struct ParserXMLImageTests {
     }
 
     @Test
+    func imageHref() throws {
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAHElEQVQI12P4//8/w38GIAXDIBKE0DHxgljNBAAO9TXL0Y4OHwAAAABJRU5ErkJggg=="
+
+        let image = try XMLParser().parseImage(["href": png, "width": "10", "height": "10"])
+        #expect(image.href.isDataURL)
+
+        let preferred = try XMLParser().parseImage(["href": "#modern", "xlink:href": "#legacy"])
+        #expect(preferred.href.fragmentID == "modern")
+
+        #expect(throws: (any Error).self) {
+            try XMLParser().parseImage(["width": "10", "height": "10"])
+        }
+    }
+
+    @Test
     func imageLineBreaks() throws {
         let base64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblA " + "\n" +
         " AAAHElEQVQI12P4//8/w38GIAXDIBKE0DHxgljNBAAO9TXL0Y4OHwAAAABJRU5ErkJggg=="
