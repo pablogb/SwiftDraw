@@ -87,9 +87,10 @@ extension LayerTree {
                 } else {
                     return nil
                 }
-            case .setLineDash(let lengths):
-                if state.top.lineDash != lengths {
-                    state.top.lineDash = lengths
+            case .setLineDash(phase: let phase, lengths: let lengths):
+                if state.top.lineDashPhase != phase || state.top.lineDashLengths != lengths {
+                    state.top.lineDashPhase = phase
+                    state.top.lineDashLengths = lengths
                 } else {
                     return nil
                 }
@@ -99,10 +100,20 @@ extension LayerTree {
                 } else {
                     return nil
                 }
+            case .setFillPattern:
+                // a pattern replaces the fill colour: a later setFill of the same colour is not redundant
+                state.top.fill = nil
             case .pushState:
                 state.push(state.top)
             case .popState:
                 state.pop()
+            case .pushFilterLayer:
+                // filter layers draw into a fresh graphics state
+                state.push(State())
+            case .popFilterLayer:
+                // renderers isolate filter layers, but do not rely on it: the outer state is unknown again
+                state.pop()
+                state.top = State()
             default: break
             }
 
@@ -139,7 +150,8 @@ extension LayerTree {
             var lineJoin: T.LineJoin?
             var lineWidth: T.Float?
             var lineMiter: T.Float?
-            var lineDash: [T.Float] = []
+            var lineDashPhase: T.Float?
+            var lineDashLengths: [T.Float]?
             var blendMode: T.BlendMode?
         }
     }
