@@ -186,6 +186,28 @@ final class LayerTreeClipMaskTests: XCTestCase {
         XCTAssertEqual(clips(c).first?.rule, .evenodd)
     }
 
+    func testEvenOddClipOfOverlappingChildrenBecomesMask() throws {
+        let c = try commands("""
+        <clipPath id="c" clip-rule="evenodd">
+          <circle cx="40" cy="40" r="20"/><circle cx="60" cy="40" r="20"/>
+        </clipPath>
+        <rect width="100" height="100" clip-path="url(#c)"/>
+        """)
+        XCTAssertTrue(clips(c).isEmpty)
+        XCTAssertGreaterThan(transparencyLayers(c), 0)
+    }
+
+    func testEvenOddClipOfApartChildrenStaysOneClip() throws {
+        let c = try commands("""
+        <clipPath id="c" clip-rule="evenodd">
+          <circle cx="20" cy="20" r="10"/><circle cx="60" cy="20" r="10"/>
+        </clipPath>
+        <rect width="100" height="100" clip-path="url(#c)"/>
+        """)
+        XCTAssertEqual(clips(c).map(\.rule), [.evenodd])
+        XCTAssertEqual(transparencyLayers(c), 0)
+    }
+
     func testMixedClipRulesBecomeMask() throws {
         let c = try commands("""
         <clipPath id="c">

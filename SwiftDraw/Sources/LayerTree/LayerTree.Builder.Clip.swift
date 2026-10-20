@@ -98,7 +98,10 @@ extension LayerTree.Builder {
         }
         let rules = Set(members.map(\.rule))
 
-        if shapes.count == members.count, rules.count <= 1, nested == nil, members.allSatisfy({ $0.clipID == nil }) {
+        // one clipping path keeps each child's own clip-rule only where no two children meet: under
+        // evenodd, overlapping children would cut holes in each other
+        if shapes.count == members.count, rules.count <= 1, nested == nil, members.allSatisfy({ $0.clipID == nil }),
+           rules.first != .evenodd || areApart(members) {
             // a clip path without any shape clips everything away
             return .shapes(shapes.isEmpty ? [.empty] : shapes, rules.first ?? .nonzero)
         }
@@ -120,6 +123,22 @@ extension LayerTree.Builder {
         let mask = LayerTree.Layer()
         mask.appendContents(.layer(region))
         return .mask(mask)
+    }
+
+    /// Whether no two members' bounding boxes meet; a clip path with many children is not compared.
+    private func areApart(_ members: [ClipMember]) -> Bool {
+        guard members.count <= 32 else { return false }
+        let boxes = members.compactMap { member in
+            makeBoundingBox(for: member.element).map { $0.applying(member.transform) }
+        }
+        guard boxes.count == members.count else { return false }
+        for (i, a) in boxes.enumerated() {
+            for b in boxes[(i + 1)...]
+            where a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height {
+                return false
+            }
+        }
+        return true
     }
 
     /// The shapes and text a `<clipPath>` child contributes: a `<use>` contributes the shape or text
