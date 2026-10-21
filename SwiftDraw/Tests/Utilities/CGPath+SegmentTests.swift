@@ -67,6 +67,31 @@ final class CGPathSegmentTests: XCTestCase {
     guard case .line(_) = segments[3] else { XCTFail("expected line"); return }
     XCTAssertEqual(segments[4], .close)
   }
+
+  func testStringGlyphsArePlacedOnTheBaseline() {
+    let font = CTFontCreateWithName("Helvetica" as CFString, 10.0, nil)
+    func glyphBounds(_ name: String) -> CGRect {
+      CTFontGetBoundingRectsForGlyphs(font, .default, [CTFontGetGlyphWithName(font, name as CFString)], nil, 1)
+    }
+    let bounds = "a_".toPath(font: font)!.boundingBox
+    // flipped to y down, the baseline at 0: "a" rises above it, "_" hangs below
+    XCTAssertEqual(bounds.minX, glyphBounds("a").minX, accuracy: 0.01)
+    XCTAssertEqual(bounds.minY, -glyphBounds("a").maxY, accuracy: 0.01)
+    XCTAssertEqual(bounds.maxY, -glyphBounds("underscore").minY, accuracy: 0.01)
+  }
+
+  func testLongStringIsBuiltInLinearTime() {
+    // 40 000 glyphs: appending each with a transform cost the whole path so far (about 100 s)
+    nonisolated(unsafe) let font = CTFontCreateWithName("Helvetica" as CFString, 10.0, nil)
+    nonisolated(unsafe) var path: CGPath?
+    let done = DispatchSemaphore(value: 0)
+    Thread {
+      path = String(repeating: "a&", count: 20_000).toPath(font: font)
+      done.signal()
+    }.start()
+    XCTAssertEqual(done.wait(timeout: .now() + 20), .success)
+    XCTAssertGreaterThan(path?.boundingBox.width ?? 0, 20_000 * 10)
+  }
 }
 
 #endif

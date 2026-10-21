@@ -154,10 +154,122 @@ final class CGClipMaskTests: XCTestCase {
         XCTAssertEqual(colors(13), .white)
     }
 
+    // MARK: - PDF: masks clip vector contents to an image of the mask
+
+    func testOverlappingEvenOddClipInPDF() throws {
+        // resvg masking/clipPath/overlapped-shapes-with-evenodd: each circle keeps its own rule
+        let pixel = try renderPDF(#"""
+            <clipPath id="c" clip-rule="evenodd">
+              <circle cx="8" cy="5" r="3"/><circle cx="5" cy="10" r="3"/><circle cx="11" cy="10" r="3"/>
+            </clipPath>
+            <rect width="16" height="16" fill="red" clip-path="url(#c)" />
+            """#)
+        XCTAssertEqual(pixel(8, 5), .red)
+        XCTAssertEqual(pixel(8, 8), .red)
+        XCTAssertEqual(pixel(1, 1), .white)
+        XCTAssertEqual(pixel(14, 2), .white)
+    }
+
+    func testMixedClipRulesInPDF() throws {
+        let pixel = try renderPDF(#"""
+            <clipPath id="c">
+              <path d="M1 1 H15 V15 H1 Z M5 5 H11 V11 H5 Z" clip-rule="evenodd"/>
+              <circle cx="8" cy="8" r="1.5" clip-rule="nonzero"/>
+            </clipPath>
+            <rect width="16" height="16" fill="red" clip-path="url(#c)" />
+            """#)
+        XCTAssertEqual(pixel(2, 8), .red)
+        XCTAssertEqual(pixel(6, 6), .white)
+        XCTAssertEqual(pixel(8, 8), .red)
+        XCTAssertEqual(pixel(0, 0), .white)
+    }
+
+    func testMaskElementInPDF() throws {
+        let pixel = try renderPDF(#"""
+            <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="16" height="16">
+              <rect width="8" height="16" fill="white"/>
+            </mask>
+            <rect width="16" height="16" fill="red" mask="url(#m)" />
+            """#)
+        XCTAssertEqual(pixel(3, 8), .red)
+        XCTAssertEqual(pixel(12, 8), .white)
+    }
+
+    func testClipPathOnClipPathStaysVectorInPDF() throws {
+        let body = #"""
+            <clipPath id="outer"><rect width="12" height="12"/></clipPath>
+            <clipPath id="c" clip-path="url(#outer)"><circle cx="8" cy="8" r="6"/></clipPath>
+            <rect width="16" height="16" fill="red" clip-path="url(#c)" />
+            """#
+        let pixel = try renderPDF(body)
+        XCTAssertEqual(pixel(6, 6), .red)
+        XCTAssertEqual(pixel(13, 8), .white)
+        XCTAssertEqual(pixel(8, 13), .white)
+        // two clips: no image in the page
+        let page = try XCTUnwrap(CGPDFDocument(CGDataProvider(data: try makePDF(body) as CFData)!)?.page(at: 1))
+        var resources: CGPDFDictionaryRef?
+        var xObjects: CGPDFDictionaryRef?
+        if let dictionary = page.dictionary, CGPDFDictionaryGetDictionary(dictionary, "Resources", &resources), let resources {
+            CGPDFDictionaryGetDictionary(resources, "XObject", &xObjects)
+        }
+        XCTAssertNil(xObjects)
+    }
+
+    func testMaskImageCoversOnlyWhatTheMaskDraws() throws {
+        // a 4 pt mask on a 1000 pt page: rasterized around the mask, not the page
+        let svg = try XCTUnwrap(SVG(xml: #"""
+        <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000">
+            <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="1000" height="1000"><rect x="500" y="500" width="4" height="4" fill="white"/></mask>
+            <rect width="1000" height="1000" fill="red" mask="url(#m)" />
+        </svg>
+        """#))
+        let data = NSMutableData()
+        var box = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+        let ctx = try XCTUnwrap(CGContext(consumer: try XCTUnwrap(CGDataConsumer(data: data as CFMutableData)), mediaBox: &box, nil))
+        ctx.beginPDFPage(nil)
+        let renderer = CGRenderer(context: ctx)
+        renderer.perform(svg.commands)
+        ctx.endPDFPage()
+        ctx.closePDF()
+        // the coarse probe, then about 4 × 4 pt at 300 ppi, not the 16 million pixels of the page
+        let spent = renderer.filterLayers.spentPasses - CGRenderer.maskProbePixels
+        XCTAssertGreaterThan(spent, 4 * 4 * 17)
+        XCTAssertLessThan(spent, 40 * 40 * 18)
+    }
+
     enum Pixel: Equatable {
         case red
         case white
         case other
+    }
+
+    func makePDF(_ body: String) throws -> Data {
+        let svg = try XCTUnwrap(SVG(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="16" height="16">
+            \(body)
+        </svg>
+        """))
+        return try svg.pdfData()
+    }
+
+    /// The PDF drawn on white at 4 px per point; `pixel(x, y)` samples the centre of point (x, y), y down.
+    func renderPDF(_ body: String) throws -> (Int, Int) -> Pixel {
+        let page = try XCTUnwrap(CGPDFDocument(CGDataProvider(data: try makePDF(body) as CFData)!)?.page(at: 1))
+        let canvas = try XCTUnwrap(CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 64 * 4,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        canvas.setFillColor(.white)
+        canvas.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+        canvas.scaleBy(x: 4, y: 4)
+        canvas.drawPDFPage(page)
+        let data = Array(UnsafeBufferPointer(start: try XCTUnwrap(canvas.data).assumingMemoryBound(to: UInt8.self), count: 64 * 64 * 4))
+        return { x, y in
+            let i = (y * 4 + 2) * 64 * 4 + (x * 4 + 2) * 4
+            let (r, g, b) = (data[i], data[i + 1], data[i + 2])
+            if r > 230, g < 25, b < 25 { return .red }
+            if r > 230, g > 230, b > 230 { return .white }
+            return .other
+        }
     }
 
     func render(_ body: String) throws -> (Int) -> Pixel {

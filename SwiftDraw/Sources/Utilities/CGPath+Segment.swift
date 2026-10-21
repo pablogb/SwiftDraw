@@ -147,11 +147,11 @@ extension String {
                 var position: CGPoint = .zero
                 CTRunGetGlyphs(run, glyphRange, &glyph)
                 CTRunGetPositions(run, glyphRange, &position)
-                var t = CGAffineTransform.identity
+                // placed as it is made: appending with a transform costs the whole path so far
+                var t = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: position.x, ty: baseline)
+                    .translatedBy(x: 0, y: baseline)
                 if let glyphPath = CTFontCreatePathForGlyph(runFont, glyph, &t) {
-                    let t = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: position.x, ty: baseline)
-                    let t1 = t.translatedBy(x: 0, y: baseline)
-                    path.addPath(glyphPath, transform: t1)
+                    path.addPath(glyphPath)
                 }
             }
         }

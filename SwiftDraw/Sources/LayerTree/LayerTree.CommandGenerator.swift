@@ -49,6 +49,8 @@ extension LayerTree {
 
         private var paths: [LayerTree.Shape: P.Types.Path] = [:]
         private var images: [LayerTree.Image: P.Types.Image] = [:]
+        // a pattern's contents by pattern, content transform and colour converter: drawn once, not per shape
+        private var patterns: [[AnyHashable]: [RendererCommand<P.Types>]] = [:]
 
         init(provider: P, size: LayerTree.Size, scale: LayerTree.Float = 3.0, options: SVG.Options) {
             self.provider = provider
@@ -91,8 +93,8 @@ extension LayerTree {
                     commands.append(contentsOf: renderCommands(forOpacity: layer.opacity))
                     commands.append(contentsOf: renderCommands(forClip: layer.clip, using: layer.clipRule))
 
-                    if state.hasMask {
-                        commands.append(.pushTransparencyLayer)
+                    if let mask = state.mask {
+                        commands.append(.pushMask(mask))
                     }
 
                     // filter is applied before clipping, masking and opacity
@@ -118,10 +120,8 @@ extension LayerTree {
                         commands.append(.popFilterLayer)
                     }
 
-                    //render apply mask
-                    if state.hasMask {
-                        commands.append(contentsOf: renderCommands(forMask: layer.mask))
-                        commands.append(.popTransparencyLayer)
+                    if let mask = state.mask {
+                        commands.append(.popMask(renderCommands(forMaskComposite: mask)))
                     }
 
                     if state.hasOpacity {
@@ -152,6 +152,8 @@ extension LayerTree {
             var hasFilters: Bool
             var colorConverter: any ColorConverter
             var filterLayer: LayerTree.FilterLayer?
+            // the mask drawn in luminance
+            var mask: [RendererCommand<P.Types>]?
         }
 
         func makeCommandState(for layer: Layer, colorConverter: any ColorConverter) -> CommandState {
@@ -175,7 +177,8 @@ extension LayerTree {
                 hasMask: hasMask,
                 hasFilters: hasFilters,
                 colorConverter: colorConverter,
-                filterLayer: hasFilters ? makeFilterLayer(for: layer, colorConverter: colorConverter) : nil
+                filterLayer: hasFilters ? makeFilterLayer(for: layer, colorConverter: colorConverter) : nil,
+                mask: layer.mask.map(renderCommands(forMask:))
             )
         }
 
@@ -227,17 +230,11 @@ extension LayerTree {
                 }
             case .pattern(let fillPattern):
                 if let (resolvedPattern, contentTransform) = Self.resolvePattern(fillPattern, in: provider.getBounds(from: shape)) {
-                    var patternCommands = [RendererCommand<P.Types>]()
-                    if contentTransform != .identity {
-                        patternCommands.append(.pushState)
-                        patternCommands.append(.concatenate(transform: provider.createTransform(from: contentTransform)))
-                    }
-                    for contents in resolvedPattern.contents {
-                        patternCommands.append(contentsOf: renderCommands(for: contents, colorConverter: colorConverter))
-                    }
-                    if contentTransform != .identity {
-                        patternCommands.append(.popState)
-                    }
+                    let key: [AnyHashable] = [ObjectIdentifier(fillPattern), contentTransform, ObjectIdentifier(type(of: colorConverter))]
+                    let patternCommands = patterns[key] ?? renderCommands(forPattern: resolvedPattern,
+                                                                          contentTransform: contentTransform,
+                                                                          colorConverter: colorConverter)
+                    patterns[key] = patternCommands
 
                     let pattern = provider.createPattern(from: resolvedPattern, contents: patternCommands)
                     let rule = provider.createFillRule(from: fill.rule)
@@ -348,6 +345,23 @@ extension LayerTree {
                 ()
             }
 
+            return commands
+        }
+
+        func renderCommands(forPattern pattern: Pattern,
+                            contentTransform: LayerTree.Transform.Matrix,
+                            colorConverter: any ColorConverter) -> [RendererCommand<P.Types>] {
+            var commands = [RendererCommand<P.Types>]()
+            if contentTransform != .identity {
+                commands.append(.pushState)
+                commands.append(.concatenate(transform: provider.createTransform(from: contentTransform)))
+            }
+            for contents in pattern.contents {
+                commands.append(contentsOf: renderCommands(for: contents, colorConverter: colorConverter))
+            }
+            if contentTransform != .identity {
+                commands.append(.popState)
+            }
             return commands
         }
 
@@ -501,23 +515,19 @@ extension LayerTree {
         }
 
 
-        func renderCommands(forMask layer: Layer?) -> [RendererCommand<P.Types>] {
-            guard let layer = layer else { return [] }
-
-            let copy = provider.createBlendMode(from: .copy)
-            let destinationIn = provider.createBlendMode(from: .destinationIn)
-
-            var commands = [RendererCommand<P.Types>]()
-            commands.append(.setBlend(mode: destinationIn))
-            commands.append(.pushTransparencyLayer)
-            commands.append(.setBlend(mode: copy))
-            //commands.append(contentsOf: renderCommands(forClip: layer.clip))
-            let drawMask = layer.contents.flatMap{
+        func renderCommands(forMask layer: Layer) -> [RendererCommand<P.Types>] {
+            layer.contents.flatMap {
                 renderCommands(for: $0, colorConverter: .luminance)
             }
-            commands.append(contentsOf: drawMask)
-            commands.append(.popTransparencyLayer)
-            return commands
+        }
+
+        /// Draws the mask over the contents' transparency layer, keeping them where the mask has alpha.
+        func renderCommands(forMaskComposite mask: [RendererCommand<P.Types>]) -> [RendererCommand<P.Types>] {
+            let copy = provider.createBlendMode(from: .copy)
+            let destinationIn = provider.createBlendMode(from: .destinationIn)
+            return [.setBlend(mode: destinationIn), .pushTransparencyLayer, .setBlend(mode: copy)]
+                + mask
+                + [.popTransparencyLayer]
         }
 
         func canRenderMask(_ commands: [RendererCommand<P.Types>]) -> Bool {
@@ -717,13 +727,16 @@ extension LayerTree.CommandGenerator {
     /// The whole periods spanning lower...upper; a radial gradient always includes period 0.
     static func makePeriods(lower: LayerTree.Float, upper: LayerTree.Float, includingZero: Bool = true) -> ClosedRange<Int>? {
         guard lower.isFinite, upper.isFinite else { return nil }
-        // bounded so the conversion to Int cannot trap; anything this large is averaged anyway
+        // bounded on both sides so the conversion to Int cannot trap. Beyond the limit a period index has
+        // no Float precision left (a 1e-18 vector puts a shape 9e19 periods out): span both sides, so it
+        // is averaged like any spread too fine to draw
         let limit: LayerTree.Float = 1_000_000
-        let floor = lower.rounded(.down)
-        let ceil = upper.rounded(.up)
-        let first = Int(max(-limit, includingZero ? min(0, floor) : floor))
-        let last = Int(min(limit, includingZero ? max(1, ceil) : ceil)) - 1
-        return first...max(first, last)
+        let first = includingZero ? min(0, lower.rounded(.down)) : lower.rounded(.down)
+        let last = (includingZero ? max(1, upper.rounded(.up)) : upper.rounded(.up)) - 1
+        guard first >= -limit, last <= limit else {
+            return -Int(limit)...Int(limit)
+        }
+        return Int(first)...Int(max(first, last))
     }
 
     // Resolves the layer's filter into its user space; nil when a primitive is unsupported

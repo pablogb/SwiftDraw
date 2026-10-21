@@ -193,16 +193,24 @@ final class LayerTreeGradientTests: XCTestCase {
         XCTAssertEqual(try color(chain(hops: LayerTree.Builder.maxGradientHops + 10)), LayerTree.Color.none)
     }
 
-    func testManyShapesSharingAnHrefdGradientAllPaint() throws {
-        // more paints than ReferenceGuard.maxReferences: gradient hrefs must not spend that budget
-        let count = LayerTree.Builder.ReferenceGuard.maxReferences + 100
+    func testManyShapesSharingAnHrefdGradientDoNotSpendTheElementBudget() throws {
+        // gradient hrefs must not spend ReferenceGuard's budget: only the elements a <use> copies do
+        let count = 1_000
         let rects = String(repeating: #"<rect width="1" height="1" fill="url(#g)"/>"#, count: count)
-        let cmds = try commands("""
-        <defs><linearGradient id="a">\(stops)</linearGradient><linearGradient id="g" xlink:href="#a"/></defs>
-        \(rects)
+        let svg = try DOM.SVG.parse(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="100">
+        <defs><linearGradient id="a">\(stops)</linearGradient><linearGradient id="g" xlink:href="#a"/>
+        <g id="all">\(rects)</g></defs><use xlink:href="#all"/>
+        </svg>
         """)
-        let drawn = cmds.filter { if case .drawLinearGradient = $0 { return true }; return false }
+        let builder = LayerTree.Builder(svg: svg)
+        let layer = builder.makeLayer()
+        let generator = LayerTree.CommandGenerator(provider: LayerTreeProvider(), size: .zero, options: .default)
+        let drawn = generator.renderCommands(for: layer, colorConverter: .default).filter {
+            if case .drawLinearGradient = $0 { return true }; return false
+        }
         XCTAssertEqual(drawn.count, count)
+        XCTAssertEqual(builder.references.elements, count + 1)
     }
 
     func testHrefChainResolvesInsideDeepUse() throws {
@@ -417,6 +425,28 @@ final class LayerTreeGradientTests: XCTestCase {
         XCTAssertEqual(Generator.makePeriods(lower: -0.5, upper: 2.2, includingZero: false), -1...2)
         XCTAssertEqual(Generator.makePeriods(lower: 5, upper: 5, includingZero: false), 5...5)
         XCTAssertEqual(Generator.makePeriods(lower: 10_000.3, upper: 10_000.7), 0...10_000)
+    }
+
+    func testMakePeriodsBeyondIntRangeDoNotTrap() throws {
+        // a 1e-18 vector puts the shape 1e19...9e19 periods out, on either side or both:
+        // more periods than are ever drawn, so the average colour is painted
+        typealias Generator = LayerTree.CommandGenerator<LayerTreeProvider>
+        let spans: [(Float, Float)] = [(1e19, 9e19), (-9e19, -1e19), (-9e19, 9e19), (-Float.greatestFiniteMagnitude, 0)]
+        for (lower, upper) in spans {
+            let periods = try XCTUnwrap(Generator.makePeriods(lower: lower, upper: upper, includingZero: false))
+            XCTAssertGreaterThan(periods.count, Generator.maxSpreadPeriods(stopCount: 2))
+        }
+        let radial = try XCTUnwrap(Generator.makePeriods(lower: 0, upper: 9e19))
+        XCTAssertGreaterThan(radial.count, Generator.maxSpreadPeriods(stopCount: 2))
+    }
+
+    func testTinyReflectVectorPaintsTheAverageColour() throws {
+        let d = try drawnLinear("""
+        <defs><linearGradient id="g" gradientUnits="userSpaceOnUse" x1="0" x2="0.000000000000000001" spreadMethod="reflect">\(stops)</linearGradient></defs>
+        <rect x="10" y="10" width="80" height="80" fill="url(#g)"/>
+        """)
+        XCTAssertEqual(d?.gradient.stops.count, 2)
+        XCTAssertEqual(d?.gradient.stops.first?.color, d?.gradient.stops.last?.color)
     }
 
     func testAverageOfMixedColourSpacesConvertsIntoTheGradientSpace() throws {

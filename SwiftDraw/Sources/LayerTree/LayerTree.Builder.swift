@@ -42,7 +42,7 @@ extension LayerTree {
         let references = ReferenceGuard()
         let activeClips = ActiveClipSet()
         let measurement = MeasurementBudget()
-        let gradients = GradientCache()
+        let resolved = ResolvedDefs()
 
         init(svg: DOM.SVG) {
             self.svg = svg
@@ -180,10 +180,20 @@ extension LayerTree {
         /// `ancestors` holds the ids of the elements enclosing `root` (and, through `<use>`, of the
         /// elements being instanced), so a `<use>` that references one of them can be dropped.
         func makeLayer(from root: DOM.GraphicsElement, inheriting previousState: State, ancestors: [String] = []) -> Layer {
-            var stack: [(DOM.GraphicsElement, State, Layer?, [String])] = [(root, previousState, nil, ancestors)]
+            // `<use>`, mask and pattern contents continue the depth of the element that references them
+            let base = references.level
+            defer { references.level = base }
+            var stack: [(DOM.GraphicsElement, State, Layer?, [String], Int)] = [(root, previousState, nil, ancestors, base)]
             var resultLayer: Layer? = nil
 
-            while let (currentElement, currentState, parentLayer, currentAncestors) = stack.popLast() {
+            while let (currentElement, currentState, parentLayer, currentAncestors, depth) = stack.popLast() {
+                guard references.spend(atDepth: depth) else {
+                    if parentLayer == nil {
+                        resultLayer = Layer()
+                    }
+                    continue
+                }
+                references.level = depth + 1
                 // transform, clip-rule and mask may come from CSS as well as attributes
                 let attributes = DOM.presentationAttributes(for: currentElement, styles: svg.styles)
                 let newState = Self.createState(for: attributes, inheriting: currentState)
@@ -195,7 +205,7 @@ extension LayerTree {
                     }
                     continue
                 }
-                let layer = makeBaseLayer(from: currentElement, attributes: attributes, with: newState)
+                let (layer, placed) = makeBaseLayer(from: currentElement, attributes: attributes, with: newState)
                 var childAncestors = currentAncestors
                 if let id = currentElement.id {
                     childAncestors.append(id)
@@ -203,15 +213,20 @@ extension LayerTree {
 
                 if let contents = makeContents(from: currentElement, with: newState, ancestors: childAncestors) {
                     layer.appendContents(contents)
+                } else if let sw = currentElement as? DOM.Switch {
+                    //TODO: select first element that creates non empty Layer
+                    if let first = sw.childElements.first {
+                        stack.append((first, newState, layer, childAncestors, depth + 1))
+                    }
                 } else if let container = currentElement as? any ContainerElement {
                     // Push children in reverse so they are processed in the original order
                     for child in container.childElements.reversed() {
-                        stack.append((child, newState, layer, childAncestors))
+                        stack.append((child, newState, layer, childAncestors, depth + 1))
                     }
                 }
 
                 if let parent = parentLayer {
-                    parent.appendContents(.layer(layer))
+                    parent.appendContents(.layer(placed))
 
                     if let svg = currentElement as? DOM.SVG {
                         let bounds = Builder.makeViewportClip(
@@ -232,30 +247,33 @@ extension LayerTree {
                     }
                 } else {
                     // This must be the top-level root layer
-                    resultLayer = layer
+                    resultLayer = placed
                 }
             }
 
             return resultLayer!
         }
 
-        func makeBaseLayer(from element: DOM.GraphicsElement, attributes: DOM.PresentationAttributes, with state: State) -> Layer {
+        /// The element's layer, which receives its contents, and the layer placed in its parent: the
+        /// same layer, or the layers holding it that intersect a nested `clip-path`.
+        func makeBaseLayer(from element: DOM.GraphicsElement, attributes: DOM.PresentationAttributes, with state: State) -> (layer: Layer, placed: Layer) {
             let l = Layer()
             l.class = element.class
             l.transform = Builder.createTransforms(from: attributes.transform ?? [])
             l.mask = createMaskLayer(for: element, attributes: attributes)
+            var placed = l
             // clip-rule comes from the <clipPath> contents and objectBoundingBox units are resolved
             // here, so every clip reaches the renderers in user space (SVG 1.1 §14.3.5)
             if let clipID = attributes.clipPath?.fragmentID,
                let clip = makeClip(id: clipID, bounds: { makeBoundingBox(for: element) }) {
-                apply(clip, to: l)
+                placed = apply(clip, to: l)
             }
             l.opacity = state.opacity
-            if let filter = makeFilter(for: element) {
+            if let filter = makeFilter(attributes: attributes) {
                 l.filters = filter.primitives
-                l.filterRegion = makeFilterRegion(for: filter)
+                l.filterRegion = filter.region
             }
-            return l
+            return (l, placed)
         }
 
         func makeContents(from element: DOM.GraphicsElement, with state: State, ancestors: [String] = []) -> Layer.Contents? {
@@ -269,10 +287,6 @@ extension LayerTree {
                 return isVisible ? try? Builder.makeImageContents(from: image) : nil
             } else if let use = element as? DOM.Use {
                 return try? makeUseLayerContents(from: use, with: state, ancestors: ancestors)
-            } else if let sw = element as? DOM.Switch,
-                      let e = sw.childElements.first {
-                //TODO: select first element that creates non empty Layer
-                return .layer(makeLayer(from: e, inheriting: state, ancestors: ancestors))
             }
 
             return nil
@@ -338,11 +352,31 @@ extension LayerTree {
         }
 
         // `filter` is not inherited: it applies once, to the element that references it
-        func makeFilter(for element: DOM.GraphicsElement) -> DOM.Filter? {
-            let attributes = DOM.presentationAttributes(for: element, styles: svg.styles)
+        func makeFilter(attributes: DOM.PresentationAttributes) -> (primitives: [LayerTree.FilterPrimitive], region: FilterRegion)? {
             guard let filterId = attributes.filter?.fragmentID else { return nil }
-            return svg.defs.filters.first(where: { $0.id == filterId })
+            if let filter = resolved.filters[filterId] {
+                return filter
+            }
+            let filter = svg.defs.filters.first(where: { $0.id == filterId }).map(makeFilter)
+            resolved.filters[filterId] = .some(filter)
+            return filter
         }
+
+        /// The primary tree only (Filter Effects 1 §9.3): pruning keeps every `in` resolving to the same
+        /// primitive, since each input of a kept primitive is kept. A filter past `maxFilterPrimitives` or
+        /// `maxFilterInputs` is unsupported: each input is a pass over the region on every draw.
+        func makeFilter(_ filter: DOM.Filter) -> (primitives: [LayerTree.FilterPrimitive], region: FilterRegion) {
+            let primitives = filter.primitives
+            guard primitives.count <= Self.maxFilterPrimitives,
+                  primitives.reduce(0, { $0 + $1.inputs.count }) <= Self.maxFilterInputs else {
+                return ([LayerTree.FilterPrimitive(effect: .unsupported(name: "filter"))], makeFilterRegion(for: filter))
+            }
+            let tree = LayerTree.FilterLayer.primaryTree(of: LayerTree.FilterLayer.makeInputs(for: primitives))
+            return (tree.map { primitives[$0] }, makeFilterRegion(for: filter))
+        }
+
+        static var maxFilterPrimitives: Int { 256 }
+        static var maxFilterInputs: Int { 256 }
 
         func makeFilterRegion(for filter: DOM.Filter) -> FilterRegion {
             FilterRegion(
@@ -540,22 +574,26 @@ extension LayerTree.Builder {
 
     func makeGradientElement(id: String?) -> GradientElement? {
         guard let id else { return nil }
-        return gradients.elements(in: svg.defs)[id]
+        return resolved.elements(in: svg.defs)[id]
     }
 
     /// nil when the url does not name a gradient. Resolved once per gradient id.
     func makeGradientPaint(for gradientId: URL) -> GradientPaint? {
         guard let id = gradientId.fragmentID else { return nil }
-        if let paint = gradients.paints[id] {
+        if let paint = resolved.paints[id] {
             return paint
         }
         let paint = makeGradientElement(id: id).map(makeGradientPaint)
-        gradients.paints[id] = paint
+        resolved.paints[id] = paint
         return paint
     }
 
-    final class GradientCache {
+    /// Paint servers and filters resolved once per id.
+    final class ResolvedDefs {
         var paints = [String: GradientPaint?]()
+        /// with the depth it was built at: its contents fit under `ReferenceGuard.maxDepth` from there or above
+        var patterns = [String: (pattern: LayerTree.Pattern, level: Int)]()
+        var filters = [String: (primitives: [LayerTree.FilterPrimitive], region: LayerTree.FilterRegion)?]()
         private var index: [String: GradientElement]?
 
         /// Every gradient by id, built once (a linear gradient wins over a radial one with the same id,
@@ -570,7 +608,7 @@ extension LayerTree.Builder {
         }
     }
 
-    /// Most href hops followed from one gradient (SVG sets no limit; this bounds hostile chains).
+    /// Most href hops followed from one gradient or pattern (SVG sets no limit; this bounds hostile chains).
     static var maxGradientHops: Int { 64 }
 
     func makeTextAttributes(with state: State) -> LayerTree.TextAttributes {
@@ -647,11 +685,18 @@ extension LayerTree.Builder {
         }
     }
 
+    /// Built once per pattern, not once per shape it fills; contents built deeper in the tree also fit above.
     func makePatternGuarded(for element: DOM.Pattern) -> LayerTree.Pattern? {
+        let level = references.level
+        if let cached = resolved.patterns[element.id], cached.level >= level {
+            return cached.pattern
+        }
         let key = "pattern:\(element.id)"
         guard references.enter(key) else { return nil }
         defer { references.leave(key) }
-        return makePattern(for: element)
+        let pattern = makePattern(for: element)
+        resolved.patterns[element.id] = (pattern, level)
+        return pattern
     }
 
     func makePattern(for element: DOM.Pattern) -> LayerTree.Pattern {
@@ -694,18 +739,16 @@ extension LayerTree.Builder {
     }
 
     /// The pattern followed by the patterns it references through href; a cycle, a reference
-    /// that is not a pattern, or a chain deeper than `ReferenceGuard.maxDepth` ends the chain.
+    /// that is not a pattern, or more than `maxGradientHops` hops ends the chain. Only attributes and
+    /// children are looked up along it: contents are built once, for the pattern itself.
     func makePatternChain(for element: DOM.Pattern) -> [DOM.Pattern] {
         var chain = [element]
         var visited: Set<String> = [element.id]
-        var entered = [String]()
-        defer { entered.forEach(references.leave) }
         var current = element
-        while let id = current.href?.fragmentID,
+        while chain.count <= Self.maxGradientHops,
+              let id = current.href?.fragmentID,
               !visited.contains(id),
-              let next = svg.defs.patterns.first(where: { $0.id == id }),
-              references.enter("patternHref:\(id)") {
-            entered.append("patternHref:\(id)")
+              let next = svg.defs.patterns.first(where: { $0.id == id }) {
             visited.insert(id)
             chain.append(next)
             current = next
@@ -996,32 +1039,49 @@ private extension DOM.SVG {
 
 extension LayerTree.Builder {
 
-    /// Bounds the work done resolving `<use>`, mask and pattern references: a reference already
-    /// being resolved is refused, as is nesting deeper than `maxDepth` (each level costs native stack,
-    /// and Backdrop renders on secondary threads) or more than `maxReferences` expansions in one
-    /// document (non-cyclic fan-out such as 2 uses per level is exponential).
+    /// Bounds the layer tree built from a document. A reference already being resolved is refused.
+    ///
+    /// `maxDepth` caps nesting document-wide, `<use>`, mask and pattern contents continuing the depth
+    /// of the element that references them: building, drawing and releasing the tree recurse per level,
+    /// and Backdrop renders on 512 KB secondary threads. Entering a reference counts `referenceDepth`
+    /// levels: it recurses natively through the builder, about 6 KB of stack (10 KB in debug builds),
+    /// where a group level costs well under 1 KB, only when the tree is released.
+    ///
+    /// `maxElements` caps the elements built inside `<use>`, mask and pattern contents, each costing one:
+    /// once it is spent their expansion stops (non-cyclic fan-out such as 10 uses of 10 uses is
+    /// exponential). The document's own elements, bounded by its size, are always built.
     ///
     /// Any new walk over a reference chain that re-enters `<use>`, mask or pattern expansion must call this.
-    /// Gradient `href` chains do not: they are bounded by `maxGradientHops`.
+    /// Gradient and pattern `href` chains do not: they are bounded by `maxGradientHops`.
     final class ReferenceGuard {
-        static let maxDepth = 16
-        static let maxReferences = 20_000
+        static let maxDepth = 200
+        static let referenceDepth = 12
+        static let maxElements = 250_000
         private var active = Set<String>()
-        private var depth = 0
-        private var total = 0
+        /// the depth of the elements built next
+        var level = 0
+        private(set) var elements = 0
 
         func enter(_ key: String) -> Bool {
-            guard depth < Self.maxDepth,
-                  total < Self.maxReferences,
+            guard level + Self.referenceDepth < Self.maxDepth,
+                  elements < Self.maxElements,
                   active.insert(key).inserted else { return false }
-            depth += 1
-            total += 1
+            level += Self.referenceDepth
             return true
         }
 
         func leave(_ key: String) {
             active.remove(key)
-            depth -= 1
+            level -= Self.referenceDepth
+        }
+
+        /// Counts an element inside a reference; false when it is too deep, or the budget is spent.
+        func spend(atDepth depth: Int) -> Bool {
+            guard depth < Self.maxDepth else { return false }
+            guard !active.isEmpty else { return true }
+            guard elements < Self.maxElements else { return false }
+            elements += 1
+            return true
         }
     }
 

@@ -30,6 +30,9 @@
 import SwiftDrawDOM
 import XCTest
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 @testable import SwiftDraw
 
 final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
@@ -174,19 +177,33 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
         XCTAssertLessThanOrEqual(s.layers, 4 * LayerTree.Builder.ReferenceGuard.maxDepth + 8)
     }
 
-    func testFanOutIsBoundedByTheReferenceBudget() throws {
-        var body = "<defs>"
-        for i in 0..<30 {
-            body += ##"<g id="g\##(i)"><use xlink:href="#g\##(i + 1)"/><use xlink:href="#g\##(i + 1)"/></g>"##
+    func testFanOutIsBoundedByTheElementBudget() throws {
+        // 10 uses of 10 uses of 10 uses of 1000 rects: 1 000 000 copies
+        var body = ##"<defs><g id="l0">"## + String(repeating: ##"<rect width="1" height="1"/>"##, count: 1_000) + "</g>"
+        for i in 1...3 {
+            body += ##"<g id="l\##(i)">"## + String(repeating: ##"<use xlink:href="#l\##(i - 1)"/>"##, count: 10) + "</g>"
         }
-        body += ##"<g id="g30"><rect width="10" height="10"/></g></defs><use xlink:href="#g0"/>"##
-        let s = try stats(body)
-        XCTAssertLessThanOrEqual(s.layers, 10 * LayerTree.Builder.ReferenceGuard.maxReferences)
+        body += ##"</defs><use xlink:href="#l3"/>"##
+        let builder = LayerTree.Builder(svg: try makeSVG(body))
+        let s = Self.stats(of: builder.makeLayer())
+        let budget = LayerTree.Builder.ReferenceGuard.maxElements
+        XCTAssertEqual(builder.references.elements, budget)
+        // every element counted built at most one shape; then copying stopped
+        XCTAssertLessThanOrEqual(s.shapes, budget)
+        XCTAssertGreaterThan(s.shapes, budget * 9 / 10)
+    }
+
+    func testManyUsesOfOneShapeAllDraw() throws {
+        // text exported as glyph <use>s: 25 600 copies, far below the element budget
+        let uses = String(repeating: ##"<use xlink:href="#d"/>"##, count: 25_600)
+        let s = try stats(##"<defs><rect id="d" width="4" height="4"/></defs>\##(uses)"##)
+        XCTAssertEqual(s.shapes, 25_600)
     }
 
     func testCapDepthFitsASmallSecondaryThreadStack() throws {
-        let maxDepth = LayerTree.Builder.ReferenceGuard.maxDepth
-        nonisolated(unsafe) let svg = try makeSVG(##"<defs>\##(Self.chain(count: maxDepth - 1))</defs><use xlink:href="#g0"/>"##)
+        // the deepest chain still drawn: each hop is a <use>, its reference and a group
+        let hops = LayerTree.Builder.ReferenceGuard.maxDepth / (LayerTree.Builder.ReferenceGuard.referenceDepth + 2) - 1
+        nonisolated(unsafe) let svg = try makeSVG(##"<defs>\##(Self.chain(count: hops))</defs><use xlink:href="#g0"/>"##)
         nonisolated(unsafe) var result = Stats()
         let done = DispatchSemaphore(value: 0)
         let thread = Thread {
@@ -199,7 +216,103 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
         XCTAssertEqual(result.shapes, 1)
     }
 
+    // MARK: - depth, on the 512 KB stack of a secondary thread
+
+    /// Builds, generates, draws into a bitmap and a PDF, and releases the tree on a 512 KB stack.
+    private func drawOnSmallStack(_ body: String, file: StaticString = #filePath, line: UInt = #line) throws -> Stats {
+        // parsed on this thread: deep nesting is the parser's to bound
+        nonisolated(unsafe) let svg = try makeSVG(body)
+        nonisolated(unsafe) var result = Stats()
+        let done = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            let layer = LayerTree.Builder(svg: svg).makeLayer()
+            result = Self.stats(of: layer)
+            #if canImport(CoreGraphics)
+            let generator = LayerTree.CommandGenerator(provider: CGProvider(), size: .init(100, 100), options: .default)
+            let commands = generator.renderCommands(for: layer, colorConverter: .default)
+            let bitmap = CGContext(data: nil, width: 100, height: 100, bitsPerComponent: 8, bytesPerRow: 0,
+                                   space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            CGRenderer(context: bitmap).perform(commands)
+            let data = NSMutableData()
+            var box = CGRect(x: 0, y: 0, width: 100, height: 100)
+            let pdf = CGContext(consumer: CGDataConsumer(data: data as CFMutableData)!, mediaBox: &box, nil)!
+            pdf.beginPDFPage(nil)
+            CGRenderer(context: pdf).perform(commands)
+            pdf.endPDFPage()
+            pdf.closePDF()
+            #endif
+            done.signal()
+        }
+        thread.stackSize = 512 * 1024
+        thread.start()
+        XCTAssertEqual(done.wait(timeout: .now() + 60), .success, file: file, line: line)
+        return result
+    }
+
+    func testDeepGroupsStopAtTheDepthCap() throws {
+        let s = try drawOnSmallStack(String(repeating: "<g>", count: 1_000) + ##"<rect width="10" height="10"/>"## + String(repeating: "</g>", count: 1_000))
+        XCTAssertEqual(s.shapes, 0)
+        XCTAssertLessThanOrEqual(s.nesting, LayerTree.Builder.ReferenceGuard.maxDepth + 1)
+    }
+
+    func testDeepSwitchesDrawTheirFirstChild() throws {
+        let s = try drawOnSmallStack(String(repeating: "<switch>", count: 150) + ##"<rect width="10" height="10"/>"## + String(repeating: "</switch>", count: 150))
+        XCTAssertEqual(s.shapes, 1)
+    }
+
+    func testDeepMaskChainFitsTheStack() throws {
+        var body = "<defs>"
+        for i in 0..<300 {
+            body += ##"<mask id="m\##(i)"><rect width="100" height="100" fill="white" mask="url(#m\##(i + 1))"/></mask>"##
+        }
+        body += ##"<mask id="m300"><rect width="100" height="100" fill="white"/></mask></defs><rect width="80" height="80" mask="url(#m0)"/>"##
+        let s = try drawOnSmallStack(body)
+        // each mask level counts as a reference: the chain is cut long before 300
+        XCTAssertLessThanOrEqual(s.maskedLayers, LayerTree.Builder.ReferenceGuard.maxDepth / LayerTree.Builder.ReferenceGuard.referenceDepth + 1)
+        XCTAssertGreaterThan(s.maskedLayers, 1)
+    }
+
+    func testDeepPatternChainFitsTheStack() throws {
+        var body = "<defs>"
+        for i in 0..<300 {
+            body += ##"<pattern id="p\##(i)" patternUnits="userSpaceOnUse" width="10" height="10"><rect width="9" height="9" fill="url(#p\##(i + 1))"/></pattern>"##
+        }
+        body += ##"<pattern id="p300" width="10" height="10"><rect width="5" height="5"/></pattern></defs><rect width="80" height="80" fill="url(#p0)"/>"##
+        let s = try drawOnSmallStack(body)
+        XCTAssertLessThanOrEqual(s.patternFills, LayerTree.Builder.ReferenceGuard.maxDepth / LayerTree.Builder.ReferenceGuard.referenceDepth + 1)
+        XCTAssertGreaterThan(s.patternFills, 1)
+    }
+
+    func testGroupsBetweenUsesShareOneDepth() throws {
+        // 20 groups per <use> hop: a capped depth per reference would allow 16 × 20 levels, one cap allows 200
+        var body = "<defs>"
+        for i in 0..<20 {
+            body += ##"<g id="g\##(i)">"## + String(repeating: "<g>", count: 20) + ##"<use xlink:href="#g\##(i + 1)"/>"## + String(repeating: "</g>", count: 20) + "</g>"
+        }
+        body += ##"<g id="g20"><rect width="10" height="10"/></g></defs><use xlink:href="#g0"/>"##
+        let s = try drawOnSmallStack(body)
+        XCTAssertEqual(s.shapes, 0)
+        XCTAssertLessThanOrEqual(s.nesting, LayerTree.Builder.ReferenceGuard.maxDepth + 1)
+    }
+
     // MARK: - mask, pattern, gradient
+
+    func testPatternIsBuiltOncePerId() throws {
+        let rects = String(repeating: ##"<rect width="10" height="10" fill="url(#p)"/>"##, count: 100)
+        let svg = try makeSVG(##"""
+        <pattern id="p" width="10" height="10" patternUnits="userSpaceOnUse">\##(String(repeating: ##"<rect width="1" height="1"/>"##, count: 10))</pattern>
+        \##(rects)
+        """##)
+        let builder = LayerTree.Builder(svg: svg)
+        let layer = builder.makeLayer()
+        let patterns = layer.contents.compactMap { contents -> LayerTree.Pattern? in
+            guard case .shape(_, _, let fill) = contents, case .pattern(let pattern) = fill.fill else { return nil }
+            return pattern
+        }
+        XCTAssertEqual(patterns.count, 100)
+        XCTAssertTrue(patterns.allSatisfy { $0 === patterns[0] })
+        XCTAssertEqual(builder.references.elements, 10)
+    }
 
     func testMaskReferencingItselfIsDroppedInsideTheMask() throws {
         let s = try stats(##"""

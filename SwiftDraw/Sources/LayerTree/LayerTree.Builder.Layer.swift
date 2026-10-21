@@ -47,14 +47,15 @@ extension LayerTree.Builder {
             throw LayerTree.Error.invalid("missing referenced element: \(use.href)")
         }
 
-        // SVG 1.1 §5.6: a `<use>` that (directly or indirectly) references one of its own ancestors is an error
-        guard !containsReferenceCycle(from: element, reaching: Set(ancestors).union([id])) else {
-            throw LayerTree.Error.invalid("circular reference: \(use.href)")
-        }
+        // refused first: the cycle check walks the referenced subtree
         guard references.enter("use:\(id)") else {
             throw LayerTree.Error.invalid("circular reference: \(use.href)")
         }
         defer { references.leave("use:\(id)") }
+        // SVG 1.1 §5.6: a `<use>` that (directly or indirectly) references one of its own ancestors is an error
+        guard !containsReferenceCycle(from: element, reaching: Set(ancestors).union([id])) else {
+            throw LayerTree.Error.invalid("circular reference: \(use.href)")
+        }
 
         let l = makeLayer(from: element, inheriting: state, ancestors: ancestors + [id])
         let x = use.x ?? 0.0

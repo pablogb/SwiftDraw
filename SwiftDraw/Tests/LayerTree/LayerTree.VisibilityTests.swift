@@ -39,7 +39,7 @@ final class LayerTreeVisibilityTests: XCTestCase {
         """)
         let layer = LayerTree.Builder(svg: svg).makeLayer()
         let generator = LayerTree.CommandGenerator(provider: LayerTreeProvider(), size: .zero, options: .default)
-        return generator.renderCommands(for: layer, colorConverter: .default)
+        return generator.renderCommands(for: layer, colorConverter: .default).expandingMasks()
     }
 
     private func fillCount(_ body: String) throws -> Int {

@@ -71,9 +71,14 @@ struct CGTransformingPattern: Hashable {
         self.transform = transform
     }
 
-    func draw(_ ctx: CGContext) {
-        let renderer = CGRenderer(context: ctx)
-        renderer.perform(contents)
+    // the contents are compared, not hashed: fills of one pattern share them, and equal arrays sharing
+    // storage compare at once
+    func hash(into hasher: inout Hasher) {
+        for value in [bounds.minX, bounds.minY, bounds.width, bounds.height,
+                      transform.a, transform.b, transform.c, transform.d, transform.tx, transform.ty] {
+            hasher.combine(value)
+        }
+        hasher.combine(contents.count)
     }
 }
 
@@ -331,19 +336,28 @@ struct CGRenderer: Renderer {
     typealias Types = CGTypes
 
     private let rootContext: CGContext
-    private let rootCTM: CGAffineTransform
-    private let filterLayers = CGFilterLayerStack()
+    private let rootBaseCTM: CGAffineTransform
+    let filterLayers: CGFilterLayerStack
     let maxFilterLayerPixels: Int
 
     // drawing goes into the innermost offscreen filter layer, if any
     var ctx: CGContext { filterLayers.context ?? rootContext }
 
-    // offscreen filter layers are bitmaps whose base space is the identity
-    var baseCTM: CGAffineTransform { filterLayers.context == nil ? rootCTM : .identity }
+    // The context's base space, which CGPattern matrices map to and CoreGraphics does not expose. PDF
+    // contexts and bitmaps made with CoreGraphics, such as offscreen filter layers, have the identity:
+    // the CTM holds any flip or placement by the caller. AppKit and UIKit set views and image handlers
+    // up in the base space, so drawing starts there.
+    var baseCTM: CGAffineTransform { filterLayers.context == nil ? rootBaseCTM : .identity }
 
     init(context: CGContext, maxFilterLayerPixels: Int = CGRenderer.defaultMaxFilterLayerPixels) {
+        self.init(context: context, maxFilterLayerPixels: maxFilterLayerPixels, drawing: nil)
+    }
+
+    // pattern cells and masks are drawn by renderers of their own, within the budget of the drawing
+    private init(context: CGContext, maxFilterLayerPixels: Int, drawing: CGFilterLayerStack?) {
         self.rootContext = context
-        self.rootCTM = context.ctm
+        self.rootBaseCTM = context.bitsPerPixel != 0 && context.isCurrentGraphicsContext ? context.ctm : .identity
+        self.filterLayers = CGFilterLayerStack(drawing: drawing)
         self.maxFilterLayerPixels = maxFilterLayerPixels
     }
 
@@ -388,12 +402,19 @@ struct CGRenderer: Renderer {
         ctx.setFillColorSpace(patternSpace)
         var alpha : CGFloat = 1.0
 
-        let cgPattern = CGPattern.make(bounds: pattern.bounds,
-                                       matrix: pattern.transform.concatenating(ctx.ctm.concatenating(baseCTM.inverted())),
-                                       step: pattern.bounds.size,
-                                       tiling: .constantSpacingMinimalDistortion,
-                                       isColored: true,
-                                       draw: pattern.draw)
+        // the pattern matrix maps to the base space: the caller's flip or placement of the drawing included
+        let matrix = pattern.transform.concatenating(ctx.ctm.concatenating(baseCTM.inverted()))
+        // CoreGraphics draws the cell once per CGPattern: shapes filled alike share one
+        let key: [AnyHashable] = [pattern, matrix.a, matrix.b, matrix.c, matrix.d, matrix.tx, matrix.ty]
+        let maxPixels = maxFilterLayerPixels
+        let drawing = filterLayers
+        let cgPattern = filterLayers.patterns[key] ?? CGPattern.make(bounds: pattern.bounds,
+                                                                     matrix: matrix,
+                                                                     step: pattern.bounds.size,
+                                                                     tiling: .constantSpacingMinimalDistortion,
+                                                                     isColored: true,
+                                                                     draw: { CGRenderer(context: $0, maxFilterLayerPixels: maxPixels, drawing: drawing).perform(pattern.contents) })
+        filterLayers.patterns[key] = cgPattern
         ctx.setFillPattern(cgPattern, colorComponents: &alpha)
     }
 
@@ -507,8 +528,7 @@ struct CGRenderer: Renderer {
 
         // blurs too small to change a pixel (every box size 1) are a pass-through:
         // draw straight into the parent, clipped to the region
-        let isVector = parent.bitsPerPixel == 0
-        let oversample: CGFloat = isVector ? 2 : 1
+        let oversample = parent.bitsPerPixel == 0 ? CGRenderer.vectorOversample : 1
         if isBlurChain && !deviations.contains(where: { CGContext.isVisibleBlur($0, scale: oversample) }) {
             filterLayers.entries.append(CGFilterLayer())
             return
@@ -520,10 +540,16 @@ struct CGRenderer: Renderer {
             deviceRect = deviceRect.intersection(visible.applying(toDevice).insetBy(dx: -spread.width, dy: -spread.height))
         }
 
-        // the offscreen itself, plus the bitmaps of the primitive tree
-        let maxPixels = isBlurChain ? maxFilterLayerPixels : maxFilterLayerPixels / (filter.peakBitmapCount + 1)
+        // the offscreen itself, plus the bitmaps of the primitive tree, within what the offscreens alive
+        // and the drawing so far leave: too little left draws the layer unfiltered
+        let bitmaps = isBlurChain ? 1 : filter.peakBitmapCount + 1
+        let maxPixels = makeMaxPixels(passes: filter.passes) / bitmaps
+        guard isAffordable(deviceRect, oversample: oversample, maxPixels: maxPixels) else {
+            filterLayers.entries.append(CGFilterLayer())
+            return
+        }
 
-        // PDF and other vector contexts: filtered groups are rasterized at 2x (2 px per point)
+        // PDF and other vector contexts: filtered groups are rasterized at 300 ppi
         guard var layer = CGFilterLayer.make(deviceRect: deviceRect,
                                              deviations: deviations,
                                              maxPixels: maxPixels,
@@ -534,6 +560,7 @@ struct CGRenderer: Renderer {
             filterLayers.entries.append(CGFilterLayer())
             return
         }
+        filterLayers.spend(layer.pixels * filter.passes)
         if !isBlurChain {
             layer.filter = filter
             layer.toDevice = toDevice
@@ -578,15 +605,162 @@ struct CGRenderer: Renderer {
         parent.restoreGState()
     }
 
+    // PDF and other vector contexts cannot express masks: the contents stay vector, clipped to the
+    // mask drawn as an image at 300 ppi
+    func pushMask(_ mask: [RendererCommand<CGTypes>]) {
+        let parent = ctx
+        guard parent.bitsPerPixel == 0 else {
+            pushTransparencyLayer()
+            return
+        }
+        parent.saveGState()
+        let toDevice = parent.userSpaceToDeviceSpaceTransform
+        let visible = parent.boundingBoxOfClipPath
+        guard !visible.isNull, !visible.isEmpty else { return }
+        // an unknown extent, or too little left of the budget: drawn unmasked
+        guard !visible.isInfinite,
+              let (image, rect) = makeMaskImage(mask, toDevice: toDevice, deviceRect: visible.applying(toDevice)) else { return }
+        guard let image else {
+            parent.clip(to: .zero)
+            return
+        }
+        parent.concatenate(toDevice.inverted())
+        parent.clip(to: rect, mask: image)
+        parent.concatenate(toDevice)
+    }
+
+    func popMask(_ composite: [RendererCommand<CGTypes>]) {
+        guard ctx.bitsPerPixel == 0 else {
+            perform(composite)
+            popTransparencyLayer()
+            return
+        }
+        ctx.restoreGState()
+    }
+
+    // The alpha the mask draws, as a DeviceGray image (clip(to:mask:) takes its gray as alpha) and its
+    // rect in device space. A coarse pass finds where it draws, so a small mask on a large page stays
+    // small. nil when the budget cannot afford it; a nil image when the mask draws nothing.
+    private func makeMaskImage(_ mask: [RendererCommand<CGTypes>], toDevice: CGAffineTransform,
+                               deviceRect: CGRect) -> (image: CGImage?, rect: CGRect)? {
+        let probe = min(CGRenderer.maskProbePixels, makeMaxPixels(passes: 1))
+        guard probe > 0,
+              let coarse = drawMask(mask, toDevice: toDevice, deviceRect: deviceRect,
+                                    maxPixels: probe, oversample: CGRenderer.vectorOversample) else { return nil }
+        filterLayers.spend(coarse.context.width * coarse.context.height)
+        guard let drawn = coarse.drawnRect else { return (nil, .zero) }
+        let rect = drawn.intersection(deviceRect)
+        let maxPixels = makeMaxPixels(passes: 1)
+        guard isAffordable(rect, oversample: CGRenderer.vectorOversample, maxPixels: maxPixels),
+              let fine = drawMask(mask, toDevice: toDevice, deviceRect: rect,
+                                  maxPixels: maxPixels, oversample: CGRenderer.vectorOversample) else { return nil }
+        filterLayers.spend(fine.context.width * fine.context.height)
+        guard let data = fine.context.data,
+              let provider = CGDataProvider(data: Data(bytes: data, count: fine.context.bytesPerRow * fine.context.height) as CFData) else { return nil }
+        let image = CGImage(width: fine.context.width, height: fine.context.height,
+                            bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: fine.context.bytesPerRow,
+                            space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                            provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        return (image, fine.rect)
+    }
+
+    // the mask drawn into an alpha-only bitmap covering deviceRect
+    private func drawMask(_ mask: [RendererCommand<CGTypes>], toDevice: CGAffineTransform, deviceRect: CGRect,
+                          maxPixels: Int, oversample: CGFloat) -> (context: CGContext, rect: CGRect, drawnRect: CGRect?)? {
+        guard !deviceRect.isNull, !deviceRect.isInfinite,
+              [deviceRect.minX, deviceRect.minY, deviceRect.width, deviceRect.height].allSatisfy(\.isFinite) else { return nil }
+        let rect = deviceRect.integral
+        guard rect.width >= 1, rect.height >= 1, rect.width.isFinite, rect.height.isFinite else { return nil }
+        let scale = CGFilterLayer.makeScale(size: rect.size, maxPixels: maxPixels, oversample: oversample)
+        let width = max(1, Int((rect.width * scale).rounded(.up)))
+        let height = max(1, Int((rect.height * scale).rounded(.up)))
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue),
+              let data = context.data else { return nil }
+        context.scaleBy(x: scale, y: scale)
+        context.translateBy(x: -rect.minX, y: -rect.minY)
+        context.concatenate(toDevice)
+        // as in a transparency layer composited destination-in: the last mask drawn over a pixel wins
+        context.setBlendMode(.copy)
+        CGRenderer(context: context, maxFilterLayerPixels: maxFilterLayerPixels, drawing: filterLayers).perform(mask)
+
+        // the drawn pixels, one pixel wider on each side for what antialiasing left below one level
+        let bytes = data.assumingMemoryBound(to: UInt8.self)
+        var minX = width, minY = height, maxX = -1, maxY = -1
+        for row in 0..<height {
+            let line = bytes + row * context.bytesPerRow
+            for column in 0..<width where line[column] != 0 {
+                minX = min(minX, column)
+                maxX = max(maxX, column)
+                minY = min(minY, row)
+                maxY = max(maxY, row)
+            }
+        }
+        let size = CGSize(width: CGFloat(width) / scale, height: CGFloat(height) / scale)
+        guard maxX >= 0 else { return (context, CGRect(origin: rect.origin, size: size), nil) }
+        // rows run from the top of the rect down
+        let drawn = CGRect(x: rect.minX + CGFloat(minX - 1) / scale,
+                           y: rect.minY + CGFloat(height - maxY - 2) / scale,
+                           width: CGFloat(maxX - minX + 3) / scale,
+                           height: CGFloat(maxY - minY + 3) / scale)
+        return (context, CGRect(origin: rect.origin, size: size), drawn)
+    }
+
+    // Pixels a bitmap of `passes` passes may have: what the offscreens alive and the drawing's rasterising
+    // so far leave
+    private func makeMaxPixels(passes: Int) -> Int {
+        min(maxFilterLayerPixels - filterLayers.livePixels,
+            (maxFilterLayerPixels * CGRenderer.drawBudgetLayers - filterLayers.spentPasses) / max(1, passes))
+    }
+
+    // Whether a bitmap within maxPixels is worth drawing: all of the rect, or at least a floor of pixels
+    private func isAffordable(_ deviceRect: CGRect, oversample: CGFloat, maxPixels: Int) -> Bool {
+        let needed = deviceRect.width * deviceRect.height * oversample * oversample
+        let floor = CGFloat(maxFilterLayerPixels / CGRenderer.minFilterLayerFraction)
+        return maxPixels > 0 && CGFloat(maxPixels) >= min(needed.isNaN ? floor : needed, floor)
+    }
+
     static let defaultMaxFilterLayerPixels = 16_777_216
+    // a drawing rasterises at most this many full-budget layers, counted in passes over their pixels
+    static let drawBudgetLayers = 64
+    // below this fraction of the budget a layer that needs more is not rasterised
+    static let minFilterLayerFraction = 256
     static let maxDeviceSpread: CGFloat = 100_000
+    static let vectorOversample: CGFloat = 300.0 / 72
+    static let maskProbePixels = 65_536
 }
 
 final class CGFilterLayerStack {
     var entries = [CGFilterLayer]()
+    // the drawing a pattern cell or mask is drawn for: its offscreens stay alive and its budget is shared
+    let drawing: CGFilterLayerStack?
+    private var spent = 0
+    // the patterns made in this context, by pattern and matrix
+    var patterns = [[AnyHashable]: CGPattern]()
+
+    init(drawing: CGFilterLayerStack? = nil) {
+        self.drawing = drawing
+    }
 
     var context: CGContext? {
         entries.last(where: { $0.offscreen != nil })?.offscreen
+    }
+
+    var livePixels: Int {
+        entries.reduce(drawing?.livePixels ?? 0) { $0 + $1.pixels }
+    }
+
+    // passes over pixels rasterised so far in the drawing: filter layers and masks
+    var spentPasses: Int {
+        drawing?.spentPasses ?? spent
+    }
+
+    func spend(_ passes: Int) {
+        if let drawing {
+            drawing.spend(passes)
+        } else {
+            spent += passes
+        }
     }
 }
 
@@ -601,6 +775,10 @@ struct CGFilterLayer {
     // nil for blur chains, blurred in place by deviations
     var filter: LayerTree.FilterLayer?
     var toDevice: CGAffineTransform = .identity
+
+    var pixels: Int {
+        offscreen.map { $0.width * $0.height } ?? 0
+    }
 
     // user space to offscreen pixels: x right, y down from the first row in memory
     var pixelTransform: CGAffineTransform {
@@ -621,7 +799,8 @@ struct CGFilterLayer {
               deviceRect.minX.isFinite, deviceRect.minY.isFinite,
               deviceRect.width.isFinite, deviceRect.height.isFinite else { return nil }
         let rect = deviceRect.integral
-        guard rect.width >= 1, rect.height >= 1 else { return nil }
+        // integral can overflow a finite rect to an infinite width
+        guard rect.width >= 1, rect.height >= 1, rect.width.isFinite, rect.height.isFinite else { return nil }
 
         let scale = makeScale(size: rect.size, maxPixels: maxPixels, oversample: oversample)
         let width = max(1, Int((rect.width * scale).rounded(.up)))
@@ -663,6 +842,21 @@ private extension LayerTree.FilterLayer.Effect {
 
 private extension LayerTree.FilterLayer {
 
+    // passes over the offscreen per draw: drawing it, three box blurs per blur, one per other
+    // primitive and per merged input
+    var passes: Int {
+        primitives.reduce(1) { total, primitive in
+            switch primitive.effect {
+            case .gaussianBlur:
+                return total + 3
+            case .merge:
+                return total + max(1, primitive.inputs.count)
+            case .offset, .flood, .composite, .blend, .colorMatrix:
+                return total + 1
+            }
+        }
+    }
+
     // How far the filter can move a pixel, in device pixels: three deviations per blur plus each offset.
     // Every path through the primitive tree is covered by the sum over all primitives.
     func deviceSpread(_ toDevice: CGAffineTransform) -> CGSize {
@@ -685,6 +879,19 @@ private extension LayerTree.FilterLayer {
         }
         return CGSize(width: width.isFinite ? min(width, CGRenderer.maxDeviceSpread) : CGRenderer.maxDeviceSpread,
                       height: height.isFinite ? min(height, CGRenderer.maxDeviceSpread) : CGRenderer.maxDeviceSpread)
+    }
+}
+
+private extension CGContext {
+    // the context AppKit or UIKit is drawing a view or image into
+    var isCurrentGraphicsContext: Bool {
+#if canImport(UIKit)
+        UIGraphicsGetCurrentContext() === self
+#elseif canImport(AppKit)
+        NSGraphicsContext.current?.cgContext === self
+#else
+        false
+#endif
     }
 }
 

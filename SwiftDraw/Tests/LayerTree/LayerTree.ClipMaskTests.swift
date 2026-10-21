@@ -43,7 +43,7 @@ final class LayerTreeClipMaskTests: XCTestCase {
         """)
         let layer = LayerTree.Builder(svg: svg).makeLayer()
         let generator = LayerTree.CommandGenerator(provider: LayerTreeProvider(), size: .zero, options: .default)
-        return generator.renderCommands(for: layer, colorConverter: .default)
+        return generator.renderCommands(for: layer, colorConverter: .default).expandingMasks()
     }
 
     private func clips(_ commands: [Command]) -> [(bounds: LayerTree.Rect, rule: LayerTree.FillRule)] {
@@ -292,10 +292,41 @@ final class LayerTreeClipMaskTests: XCTestCase {
         <clipPath id="c" clip-path="url(#inner)"><rect width="10" height="10"/></clipPath>
         <rect width="50" height="50" fill="red" clip-path="url(#c)"/>
         """)
-        // the outer clip is drawn as a mask, clipped by the inner one
-        XCTAssertGreaterThan(transparencyLayers(c), 0)
+        // shapes only: two vector clips, the inner one outermost, so a PDF keeps them vector
+        XCTAssertEqual(transparencyLayers(c), 0)
+        XCTAssertEqual(clips(c).count, 2)
         assertRect(clips(c).first?.bounds, 5, 5, 10, 10)
+        assertRect(clips(c).last?.bounds, 0, 0, 10, 10)
+        XCTAssertEqual(fills(c).map(\.bounds.width), [50])
+    }
+
+    func testClipPathOnClipPathWithTextIsMask() throws {
+        let c = try commands("""
+        <clipPath id="inner"><text x="5" y="20">Hi</text></clipPath>
+        <clipPath id="c" clip-path="url(#inner)"><rect width="10" height="10"/></clipPath>
+        <rect width="50" height="50" fill="red" clip-path="url(#c)"/>
+        """)
+        // text cannot be a clipping path: the outer clip is drawn as a mask, masked by the inner one
+        XCTAssertGreaterThan(transparencyLayers(c), 0)
         XCTAssertEqual(fills(c).map(\.bounds.width), [50, 10])
+    }
+
+    func testClipPathOnClipPathKeepsTheElementTransform() throws {
+        let svg = try DOM.SVG.parse(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        <clipPath id="inner"><rect x="5" y="5" width="10" height="10"/></clipPath>
+        <clipPath id="c" clip-path="url(#inner)"><rect width="10" height="10"/></clipPath>
+        <rect width="50" height="50" fill="red" opacity="0.5" transform="translate(20, 30)" clip-path="url(#c)"/>
+        </svg>
+        """)
+        let root = LayerTree.Builder(svg: svg).makeLayer()
+        // the layer holding the second clip takes the transform: both clips are in the element's user space
+        let outer = try XCTUnwrap(findLayer(in: root) { $0.clip.first?.shape == .rect(within: .init(x: 5, y: 5, width: 10, height: 10), radii: .zero) })
+        XCTAssertEqual(outer.transform, [.translate(tx: 20, ty: 30)])
+        guard case .layer(let inner) = try XCTUnwrap(outer.contents.first) else { return XCTFail("no inner layer") }
+        XCTAssertEqual(inner.transform, [])
+        XCTAssertEqual(inner.opacity, 0.5)
+        XCTAssertEqual(inner.clip.first?.shape, .rect(within: .init(x: 0, y: 0, width: 10, height: 10), radii: .zero))
     }
 
     func testSelfReferencingClipPathKeepsDocument() throws {
@@ -419,8 +450,9 @@ final class LayerTreeClipMaskTests: XCTestCase {
         <clipPath id="b" clip-path="url(#a)"><rect width="20" height="20"/></clipPath>
         <rect width="50" height="50" fill="red" clip-path="url(#a)"/>
         """)
-        // a → b → (a dropped): b clips a, both are drawn as masks
-        XCTAssertEqual(fills(c).map(\.bounds.width), [50, 10, 20])
+        // a → b → (a dropped): b clips a, two vector clips
+        XCTAssertEqual(clips(c).map(\.bounds.width), [20, 10])
+        XCTAssertEqual(fills(c).map(\.bounds.width), [50])
     }
 
     func testClipPathInsideMaskContents() throws {
@@ -496,7 +528,7 @@ final class LayerTreeClipMaskTests: XCTestCase {
     }
 
     func testClipPathChainFitsASmallSecondaryThreadStack() throws {
-        // each nested clip-path costs native stack: the chain is cut at ReferenceGuard.maxDepth
+        // each nested clip-path costs native stack: the chain is cut at ActiveClipSet.maxDepth
         let chain = (0..<2_000).map {
             ##"<clipPath id="c\##($0)" clip-path="url(#c\##($0 + 1))"><rect width="90" height="90"/></clipPath>"##
         }.joined()
@@ -531,6 +563,23 @@ final class LayerTreeClipMaskTests: XCTestCase {
         layer.contents.flatMap { c -> [LayerTree.Layer.Contents] in
             if case let .layer(child) = c { return allContents(of: child) }
             return [c]
+        }
+    }
+}
+
+extension Array {
+    /// Masks as renderers with transparency layers draw them: the contents into a layer, then the
+    /// mask composited over them.
+    func expandingMasks<T>() -> [RendererCommand<T>] where Element == RendererCommand<T> {
+        flatMap { command -> [RendererCommand<T>] in
+            switch command {
+            case .pushMask:
+                return [.pushTransparencyLayer]
+            case .popMask(let composite):
+                return composite.expandingMasks() + [.popTransparencyLayer]
+            default:
+                return [command]
+            }
         }
     }
 }

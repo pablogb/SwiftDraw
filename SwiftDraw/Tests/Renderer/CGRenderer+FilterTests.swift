@@ -129,7 +129,7 @@ final class CGRendererFilterTests: XCTestCase {
         XCTAssertEqual(bitmap.alpha(x: 50, y: 75), 0)
     }
 
-    // blurred groups are rasterized at 2x in PDF contexts
+    // blurred groups are rasterized at 300 ppi in PDF contexts
     func testPDFContextSmoke() throws {
         let svg = try XCTUnwrap(SVG(xml: #"""
         <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
@@ -147,6 +147,75 @@ final class CGRendererFilterTests: XCTestCase {
         ctx.closePDF()
 
         XCTAssertGreaterThan(data.length, 1000)
+    }
+
+    func testPDFFiltersAreRasterizedAt300PPI() throws {
+        // a 72 pt filter region: an inch, 300 pixels
+        let svg = try XCTUnwrap(SVG(xml: #"""
+        <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <filter id="blur" filterUnits="userSpaceOnUse" x="10" y="10" width="72" height="72"><feGaussianBlur stdDeviation="1" /></filter>
+            <rect x="20" y="20" width="50" height="50" fill="black" filter="url(#blur)" />
+        </svg>
+        """#))
+        let data = NSMutableData()
+        var box = CGRect(x: 0, y: 0, width: 100, height: 100)
+        let ctx = try XCTUnwrap(CGContext(consumer: try XCTUnwrap(CGDataConsumer(data: data as CFMutableData)), mediaBox: &box, nil))
+        ctx.beginPDFPage(nil)
+        let renderer = CGRenderer(context: ctx)
+        renderer.perform(svg.commands)
+        ctx.endPDFPage()
+        ctx.closePDF()
+        // one blur: the offscreen is drawn and blurred in three box passes
+        XCTAssertEqual(renderer.filterLayers.spentPasses, 300 * 300 * 4)
+    }
+
+    func testNestedFilterLayersShareTheBudget() throws {
+        // each layer covers the whole drawing: the outer one takes the budget, the inner ones draw
+        // straight into it, so memory does not grow with nesting
+        let svg = try XCTUnwrap(SVG(xml: #"""
+        <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <filter id="blur" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><feGaussianBlur stdDeviation="2" /></filter>
+            <g filter="url(#blur)"><g filter="url(#blur)"><g filter="url(#blur)">
+                <rect x="25" y="25" width="50" height="50" fill="black" />
+            </g></g></g>
+        </svg>
+        """#))
+        let bitmap = try XCTUnwrap(CGContext(data: nil, width: 100, height: 100, bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let renderer = CGRenderer(context: bitmap, maxFilterLayerPixels: 100 * 100)
+        renderer.perform(svg.commands)
+        XCTAssertEqual(renderer.filterLayers.spentPasses, 100 * 100 * 4)
+        XCTAssertTrue(renderer.filterLayers.entries.isEmpty)
+        // still blurred, once
+        let data = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
+        let alpha = { (x: Int, y: Int) in Double(data[y * bitmap.bytesPerRow + x * 4 + 3]) / 255 }
+        XCTAssertEqual(alpha(50, 50), 1, accuracy: 0.01)
+        XCTAssertGreaterThan(alpha(23, 50), 0.05)
+        XCTAssertLessThan(alpha(23, 50), 0.5)
+    }
+
+    func testFilterBudgetPerDrawingRunsOut() throws {
+        // 100 small shapes whose filter regions each cover the whole drawing: once the drawing's
+        // budget is spent, the rest are drawn unfiltered
+        let rects = (0..<100).map { i in
+            #"<rect x="\#(i % 10 * 10 + 3)" y="\#(i / 10 * 10 + 3)" width="4" height="4" fill="black" filter="url(#blur)" />"#
+        }.joined()
+        let bitmap = try render(#"""
+        <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <filter id="blur" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><feGaussianBlur stdDeviation="1" /></filter>
+            \#(rects)
+        </svg>
+        """#, maxFilterLayerPixels: 100 * 100)
+        // the first is blurred past its edge, the last is not
+        XCTAssertGreaterThan(bitmap.alpha(x: 2, y: 5), 0)
+        XCTAssertEqual(bitmap.alpha(x: 92, y: 95), 0)
+        XCTAssertEqual(bitmap.alpha(x: 95, y: 95), 1)
+    }
+
+    func testFilterLayerOfOverflowingRectIsNotMade() {
+        // finite, but its integral (maxX = 2e308) is not: no Int(NaN) trap
+        XCTAssertNil(CGFilterLayer.make(deviceRect: CGRect(x: 1e308, y: 0, width: 1e308, height: 10),
+                                        deviations: [], maxPixels: 1_000, oversample: 1, colorSpace: nil))
     }
 
     // shape near the top: catches a vertically flipped composite

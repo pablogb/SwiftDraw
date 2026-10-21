@@ -274,6 +274,64 @@ final class LayerTreeFilterTests: XCTestCase {
     }
 }
 
+extension LayerTreeFilterTests {
+
+    // MARK: - cost bounds, resolved once per filter
+
+    func testPrimitivesOutsideThePrimaryTreeAreDroppedOncePerFilter() throws {
+        let floods = String(repeating: "<feFlood/>", count: 200)
+        let rects = String(repeating: #"<rect width="8" height="8" filter="url(#f)"/>"#, count: 50)
+        let svg = try DOM.SVG.parse(xml: #"""
+        <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <filter id="f">\#(floods)<feGaussianBlur in="SourceGraphic" stdDeviation="2"/></filter>\#(rects)
+        </svg>
+        """#)
+        let builder = LayerTree.Builder(svg: svg)
+        let filtered = builder.makeLayer().allLayers.filter { !$0.filters.isEmpty }
+        XCTAssertEqual(filtered.count, 50)
+        XCTAssertEqual(filtered.map(\.filters.count), Array(repeating: 1, count: 50))
+        XCTAssertEqual(builder.resolved.filters.count, 1)
+    }
+
+    func testTooManyPrimitivesIsUnsupported() throws {
+        let floods = String(repeating: "<feFlood/>", count: LayerTree.Builder.maxFilterPrimitives + 1)
+        let xml = #"""
+        <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <filter id="f">\#(floods)</filter>
+            <rect width="8" height="8" filter="url(#f)"/>
+        </svg>
+        """#
+        let commands = try makeCommands(xml)
+        XCTAssertTrue(commands.filterLayers.isEmpty)
+        XCTAssertEqual(commands.names, ["setFillColor", "fillPath"])
+        XCTAssertTrue(try makeCommands(xml, options: .hideUnsupportedFilters).names.isEmpty)
+    }
+
+    func testTooManyMergeInputsIsUnsupported() throws {
+        // one primitive, each input a pass over the region
+        let nodes = String(repeating: #"<feMergeNode in="SourceGraphic"/>"#, count: LayerTree.Builder.maxFilterInputs + 1)
+        let commands = try makeCommands(#"""
+        <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <filter id="f"><feMerge>\#(nodes)</feMerge></filter>
+            <rect width="8" height="8" filter="url(#f)"/>
+        </svg>
+        """#)
+        XCTAssertTrue(commands.filterLayers.isEmpty)
+        XCTAssertEqual(commands.names, ["setFillColor", "fillPath"])
+    }
+
+    func testMergeUnderTheCapIsDrawn() throws {
+        let nodes = String(repeating: #"<feMergeNode in="SourceGraphic"/>"#, count: 8)
+        let commands = try makeCommands(#"""
+        <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <filter id="f"><feMerge>\#(nodes)</feMerge></filter>
+            <rect width="8" height="8" filter="url(#f)"/>
+        </svg>
+        """#)
+        XCTAssertEqual(commands.filterLayers.first?.primitives.first?.inputs.count, 8)
+    }
+}
+
 private extension LayerTreeFilterTests {
 
     func makeCommands(_ xml: String, options: SVG.Options = .default) throws -> [RendererCommand<LayerTreeTypes>] {

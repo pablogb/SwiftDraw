@@ -38,6 +38,8 @@ extension LayerTree.Builder {
     enum Clip {
         /// A union of shapes sharing one clip-rule, applied with a single `setClip`.
         case shapes([LayerTree.ClipShape], LayerTree.FillRule)
+        /// Such a union clipped again by the `clip-path` of the `<clipPath>` itself: a second clip, still vector.
+        indirect case intersection([LayerTree.ClipShape], LayerTree.FillRule, Clip)
         /// Geometry one clipping path cannot express (text, mixed clip-rules, a `clip-path` on the
         /// `<clipPath>` itself): drawn opaque white and applied as an alpha mask.
         case mask(LayerTree.Layer)
@@ -65,8 +67,8 @@ extension LayerTree.Builder {
 
         // a clip path that (indirectly) clips itself is ignored; the active set is not counted
         // against the document-wide reference budget, so any number of elements may share a clip.
-        // Each nested clip-path costs native stack, so nesting stops at ReferenceGuard.maxDepth.
-        guard activeClips.count < ReferenceGuard.maxDepth,
+        // Each nested clip-path costs native stack, so nesting stops at ActiveClipSet.maxDepth.
+        guard activeClips.count < ActiveClipSet.maxDepth,
               activeClips.insert(id).inserted else { return nil }
         defer { activeClips.remove(id) }
 
@@ -100,10 +102,19 @@ extension LayerTree.Builder {
 
         // one clipping path keeps each child's own clip-rule only where no two children meet: under
         // evenodd, overlapping children would cut holes in each other
-        if shapes.count == members.count, rules.count <= 1, nested == nil, members.allSatisfy({ $0.clipID == nil }),
+        let nestedClip = nested.flatMap { makeClip(id: $0, bounds: bounds) }
+        if shapes.count == members.count, rules.count <= 1, members.allSatisfy({ $0.clipID == nil }),
            rules.first != .evenodd || areApart(members) {
             // a clip path without any shape clips everything away
-            return .shapes(shapes.isEmpty ? [.empty] : shapes, rules.first ?? .nonzero)
+            let union = shapes.isEmpty ? [LayerTree.ClipShape.empty] : shapes
+            switch nestedClip {
+            case nil:
+                return .shapes(union, rules.first ?? .nonzero)
+            case .shapes?, .intersection?:
+                return .intersection(union, rules.first ?? .nonzero, nestedClip!)
+            case .mask?:
+                break
+            }
         }
 
         let content = LayerTree.Layer()
@@ -115,13 +126,11 @@ extension LayerTree.Builder {
         }
 
         let region = LayerTree.Layer()
-        if let nested, let clip = makeClip(id: nested, bounds: bounds) {
-            apply(clip, to: region)
-        }
+        let placed = nestedClip.map { apply($0, to: region) } ?? region
         region.appendContents(.layer(content))
 
         let mask = LayerTree.Layer()
-        mask.appendContents(.layer(region))
+        mask.appendContents(.layer(placed))
         return .mask(mask)
     }
 
@@ -179,35 +188,47 @@ extension LayerTree.Builder {
             state.fill = .color(.keyword(.white))
             state.fillRule = member.rule
             l.appendContents(makeShapeContents(from: shape, with: state))
-            applyMemberClip(of: member, to: l)
+            return applyMemberClip(of: member, to: l)
         } else if let text = member.element as? DOM.Text {
             let state = createState(for: text, inheriting: State())
             if case .text(let string, let point, var attributes) = makeTextContents(from: text, with: state) {
                 attributes.color = .white
                 l.appendContents(.text(string, point, attributes))
             }
-            applyMemberClip(of: member, to: l)
+            return applyMemberClip(of: member, to: l)
         }
         return l
     }
 
     /// A `clip-path` on a `<clipPath>` child clips that child only, in the child's user space.
-    private func applyMemberClip(of member: ClipMember, to layer: LayerTree.Layer) {
+    private func applyMemberClip(of member: ClipMember, to layer: LayerTree.Layer) -> LayerTree.Layer {
         guard let id = member.clipID,
-              let clip = makeClip(id: id, bounds: { makeBoundingBox(for: member.element) }) else { return }
-        apply(clip, to: layer)
+              let clip = makeClip(id: id, bounds: { makeBoundingBox(for: member.element) }) else { return layer }
+        return apply(clip, to: layer)
     }
 
-    func apply(_ clip: Clip, to layer: LayerTree.Layer) {
+    /// Clips `layer`; returns the layer to place where `layer` was: `layer` itself, or for an intersection
+    /// the layers holding it, each adding a clip, the outermost taking over `layer`'s transform.
+    @discardableResult
+    func apply(_ clip: Clip, to layer: LayerTree.Layer) -> LayerTree.Layer {
         switch clip {
         case let .shapes(shapes, rule):
             layer.clip = shapes
             layer.clipRule = rule
+            return layer
+        case let .intersection(shapes, rule, nested):
+            layer.clip = shapes
+            layer.clipRule = rule
+            let outer = LayerTree.Layer()
+            outer.transform = layer.transform
+            layer.transform = []
+            outer.appendContents(.layer(layer))
+            return apply(nested, to: outer)
         case let .mask(mask):
             guard let existing = layer.mask else {
                 layer.mask = mask
                 layer.maskIsClip = true
-                return
+                return layer
             }
             // a mask and a clip together: the clip masks the mask's own contents
             let inner = LayerTree.Layer()
@@ -216,6 +237,7 @@ extension LayerTree.Builder {
             let combined = LayerTree.Layer()
             combined.appendContents(.layer(inner))
             layer.mask = combined
+            return layer
         }
     }
 
@@ -342,6 +364,7 @@ extension LayerTree.Builder.Bounds {
 
 /// Ids of the clip paths being resolved, to drop cycles.
 final class ActiveClipSet {
+    static let maxDepth = 16
     private var ids = Set<String>()
 
     var count: Int { ids.count }

@@ -58,8 +58,9 @@ public extension CGContext {
             return
         }
 
-        let cols = Int(ceil(rect.size.width / svg.size.width))
-        let rows = Int(ceil(rect.size.height / svg.size.height))
+        // an empty or tiny size makes the count infinite or too large for Int: no tiles
+        let cols = max(0, Int(exactly: ceil(rect.size.width / svg.size.width)) ?? 0)
+        let rows = max(0, Int(exactly: ceil(rect.size.height / svg.size.height)) ?? 0)
 
         for r in 0..<rows {
             for c in 0..<cols {
@@ -104,8 +105,8 @@ public extension CGContext {
         clip(to: [rect])
 
         if byTiling {
-            let cols = Int(ceil(rect.width / source.width))
-            let rows = Int(ceil(rect.height / source.height))
+            let cols = max(0, Int(exactly: ceil(rect.width / source.width)) ?? 0)
+            let rows = max(0, Int(exactly: ceil(rect.height / source.height)) ?? 0)
             for r in 0..<rows {
                 for c in 0..<cols {
                     let tile = CGRect(

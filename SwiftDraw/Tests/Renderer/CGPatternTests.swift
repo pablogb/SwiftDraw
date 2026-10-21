@@ -101,7 +101,69 @@ final class CGPatternTests: XCTestCase {
     }
 }
 
-private extension CGPatternTests {
+extension CGPatternTests {
+
+    // As an app page: CoreGraphics contexts the caller has flipped and placed 8 px down before drawing.
+    // Tiles at y = 4 + 8k, red in the top half of each, so rows 8 + 4...8 and 8 + 12...16 are red.
+
+    func testPatternInAFlippedAndTranslatedBitmap() throws {
+        let colors = try renderPlaced(pdf: false)
+        XCTAssertEqual(colors(9), .white)
+        XCTAssertEqual(colors(13), .red)
+        XCTAssertEqual(colors(17), .white)
+        XCTAssertEqual(colors(21), .red)
+    }
+
+    func testPatternInAFlippedAndTranslatedPDF() throws {
+        let colors = try renderPlaced(pdf: true)
+        XCTAssertEqual(colors(9), .white)
+        XCTAssertEqual(colors(13), .red)
+        XCTAssertEqual(colors(17), .white)
+        XCTAssertEqual(colors(21), .red)
+    }
+
+    /// Samples column 8 of a 16×24 drawing, rows from the top.
+    func renderPlaced(pdf: Bool) throws -> (Int) -> Pixel {
+        let svg = try XCTUnwrap(SVG(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">
+            <defs><pattern id="p" y="4" width="16" height="8" patternUnits="userSpaceOnUse"><rect width="16" height="4" fill="red" /></pattern></defs>
+            <rect width="16" height="16" fill="url(#p)" />
+        </svg>
+        """))
+        func place(_ ctx: CGContext) {
+            ctx.translateBy(x: 0, y: 24)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.translateBy(x: 0, y: 8)
+            ctx.draw(svg)
+        }
+        let canvas = try XCTUnwrap(CGContext(data: nil, width: 16, height: 24, bitsPerComponent: 8, bytesPerRow: 16 * 4,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        canvas.setFillColor(.white)
+        canvas.fill(CGRect(x: 0, y: 0, width: 16, height: 24))
+        if pdf {
+            let data = NSMutableData()
+            var box = CGRect(x: 0, y: 0, width: 16, height: 24)
+            let ctx = try XCTUnwrap(CGContext(consumer: try XCTUnwrap(CGDataConsumer(data: data as CFMutableData)), mediaBox: &box, nil))
+            ctx.beginPDFPage(nil)
+            place(ctx)
+            ctx.endPDFPage()
+            ctx.closePDF()
+            canvas.drawPDFPage(try XCTUnwrap(CGPDFDocument(CGDataProvider(data: data as CFData)!)?.page(at: 1)))
+        } else {
+            place(canvas)
+        }
+        let bytes = Array(UnsafeBufferPointer(start: try XCTUnwrap(canvas.data).assumingMemoryBound(to: UInt8.self), count: 16 * 24 * 4))
+        return { row in
+            let i = (row * 16 + 8) * 4
+            if bytes[i] > 230, bytes[i + 1] < 25, bytes[i + 2] < 25 { return .red }
+            if bytes[i] > 230, bytes[i + 1] > 230, bytes[i + 2] > 230 { return .white }
+            return .other
+        }
+    }
+}
+
+extension CGPatternTests {
 
     enum Pixel: Equatable {
         case red

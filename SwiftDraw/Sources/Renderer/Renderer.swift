@@ -105,6 +105,21 @@ protocol Renderer {
 
     func pushFilterLayer(_ filter: LayerTree.FilterLayer)
     func popFilterLayer()
+
+    func pushMask(_ mask: [RendererCommand<Types>])
+    func popMask(_ composite: [RendererCommand<Types>])
+}
+
+extension Renderer {
+    // the contents are drawn into a transparency layer, then `composite` draws the mask into it
+    func pushMask(_ mask: [RendererCommand<Types>]) {
+        pushTransparencyLayer()
+    }
+
+    func popMask(_ composite: [RendererCommand<Types>]) {
+        perform(composite)
+        popTransparencyLayer()
+    }
 }
 
 extension Renderer {
@@ -164,6 +179,10 @@ extension Renderer {
             pushFilterLayer(f)
         case .popFilterLayer:
             popFilterLayer()
+        case .pushMask(let mask):
+            pushMask(mask)
+        case .popMask(let composite):
+            popMask(composite)
         }
     }
 
@@ -209,6 +228,12 @@ enum RendererCommand<Types: RendererTypes>: @unchecked Sendable {
     // draws the following commands offscreen until popFilterLayer, then composites the filtered result
     case pushFilterLayer(LayerTree.FilterLayer)
     case popFilterLayer
+
+    // the following commands until popMask are masked by the alpha the mask commands draw. Renderers
+    // with transparency layers draw them into one and perform the composite commands when popped (the
+    // mask with a destination-in blend); others may clip to the mask before the contents are drawn
+    case pushMask([RendererCommand<Types>])
+    case popMask([RendererCommand<Types>])
 }
 
 

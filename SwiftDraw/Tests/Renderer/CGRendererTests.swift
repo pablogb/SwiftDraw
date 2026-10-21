@@ -39,6 +39,16 @@ import XCTest
 
 final class CGRendererTests: XCTestCase {
   
+  func testTilingByAnEmptyOrTinySizeDrawsNoTiles() throws {
+    // the tile count was converted with Int(): infinite or past Int.max, it trapped
+    let svg = try XCTUnwrap(SVG(xml: #"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#))
+    let ctx = try XCTUnwrap(CGContext(data: nil, width: 10, height: 10, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    ctx.draw(svg.sized(CGSize(width: 1e-300, height: 1e-300)), in: CGRect(x: 0, y: 0, width: 10, height: 10), byTiling: true)
+    ctx.draw(svg.sized(.zero), in: CGRect(x: 0, y: 0, width: 10, height: 10), byTiling: true)
+    ctx.draw(svg, in: CGRect(x: 0, y: 0, width: 10, height: 10), capInsets: (1, 1, 1, 1e-300), byTiling: true)
+  }
+
   func testDrawsRect() {
     let renderer = ImageRenderer(pixelsWide: 2, pixelsHigh: 2)
     
