@@ -649,6 +649,18 @@ struct ParserXMLStyleSheetCascadeTests {
     }
 
     @Test
+    func substringTestPastTheBudgetIsNotRun() throws {
+        // one 1 KB pattern against a 200 KB value: 12.8 M, more than the whole budget
+        let value = String(repeating: "a", count: 200_000)
+        let pattern = String(repeating: "a", count: 1_000) + "b"
+        let (m, root) = try matcher(style: #"[data-x*="\#(pattern)"] { fill: red }"#, body: #"<g data-x="\#(value)"/>"#)
+        let start = Date()
+        #expect(m.match(try #require(root.children.first))?.attributes.fill == nil)
+        // the naive search took 8 s
+        #expect(Date().timeIntervalSince(start) < 1)
+    }
+
+    @Test
     func substringTestIsChargedByItsPatternLength() throws {
         let d = String(repeating: "L1 1 ", count: 3_200)
         let pattern = String(repeating: "x", count: 200)

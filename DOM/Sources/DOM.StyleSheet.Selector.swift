@@ -628,6 +628,8 @@ package extension DOM.StyleSheet {
                 let length = actual.utf8.count
                 evaluations += op == .substring ? length * max(1, a.value.utf8.count) / 16
                     : length / (op == .includes ? 4 : 8)
+                // charged before it runs: a search the budget cannot pay for is not run
+                guard evaluations < evaluationBudget else { return false }
             }
             var expected = a.value
             if a.caseInsensitive {
