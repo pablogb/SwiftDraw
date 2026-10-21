@@ -95,7 +95,8 @@ struct RendererCoreGraphicsCostTests {
     @Test
     func shapesEstimatedCost() throws {
         let image = try #require(SVG(named: "shapes.svg", in: .test))
-        #expect(image.commands.estimatedCost == 19220)
+        // with its two <use> copies marked
+        #expect(image.commands.estimatedCost == 19252)
     }
 }
 

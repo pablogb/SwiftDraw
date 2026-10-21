@@ -297,6 +297,18 @@ final class CGClipMaskTests: XCTestCase {
         XCTAssertEqual(colors(0), .white)
     }
 
+    func testMaskedZeroLengthSubpathsKeepTheirCaps() throws {
+        // `M x y Z` draws only its square caps, at x = 3 and 13; the layer is drawn within what it covers
+        let colors = try render(#"""
+            <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="16" height="16"><rect width="16" height="16" fill="white"/></mask>
+            <g mask="url(#m)"><path d="M3 8 Z M13 8 Z" stroke="red" stroke-width="4" stroke-linecap="square"/><rect x="7" y="7" width="2" height="2" fill="red"/></g>
+            """#)
+        XCTAssertEqual(colors(2), .red)
+        XCTAssertEqual(colors(8), .red)
+        XCTAssertEqual(colors(14), .red)
+        XCTAssertEqual(colors(6), .white)
+    }
+
     enum Pixel: Equatable {
         case red
         case white

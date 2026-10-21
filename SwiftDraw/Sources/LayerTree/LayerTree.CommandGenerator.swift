@@ -89,6 +89,10 @@ extension LayerTree {
 
                     stack.append(.endLayer(layer, state))
 
+                    if layer.isCopy && !layer.contents.isEmpty {
+                        commands.append(.pushCopy)
+                    }
+
                     if state.hasOpacity || state.hasTransform || state.hasClip || state.hasMask {
                         commands.append(.pushState)
                     }
@@ -136,6 +140,10 @@ extension LayerTree {
 
                     if state.hasOpacity || state.hasTransform || state.hasClip || state.hasMask {
                         commands.append(.popState)
+                    }
+
+                    if layer.isCopy && !layer.contents.isEmpty {
+                        commands.append(.popCopy)
                     }
                 }
             }
@@ -946,7 +954,7 @@ extension LayerTree.CommandGenerator {
                 if case .color(.none) = stroke.color {
                     add(shape.bounds)
                 } else {
-                    add(shape.bounds?.outset(by: stroke.coverage))
+                    add(shape.strokedBounds?.outset(by: stroke.coverage))
                 }
             case .image(let image):
                 add(image.width.flatMap { width in
@@ -1138,6 +1146,18 @@ private extension LayerTree.Shape {
 
     var gradientEndpoints: (start: LayerTree.Point, end: LayerTree.Point)? {
         bounds?.gradientEndpoints
+    }
+
+    /// The bounds a stroke grows from: a subpath of no length (`M x y Z`) still draws its caps.
+    var strokedBounds: LayerTree.Rect? {
+        guard case .path(let path) = self else { return bounds }
+        let dots = path.segments.indices.compactMap { index -> LayerTree.Point? in
+            guard case .move(to: let point) = path.segments[index], index + 1 < path.segments.count,
+                  path.segments[index + 1].isClose else { return nil }
+            return point
+        }
+        guard !dots.isEmpty, let rect = LayerTree.Rect.makeBounds(between: dots) else { return bounds }
+        return path.segments.contains { !$0.isMove && !$0.isClose } ? path.bounds.union(rect) : rect
     }
 
     var bounds: LayerTree.Rect? {

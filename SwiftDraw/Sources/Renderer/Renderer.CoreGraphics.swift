@@ -33,6 +33,7 @@
 import Foundation
 import CoreText
 import Accelerate
+import ImageIO
 #if canImport(UIKit)
 import UIKit
 #elseif canImport(AppKit)
@@ -55,7 +56,8 @@ struct CGTypes: RendererTypes, Sendable {
     typealias FillRule = CGPathFillRule
     typealias LineCap = CGLineCap
     typealias LineJoin = CGLineJoin
-    typealias Image = CGImage
+    // decoded when drawn, at the size drawn when it is large
+    typealias Image = CGImageSource
 }
 
 struct CGTransformingPattern: Hashable {
@@ -294,20 +296,20 @@ struct CGProvider: RendererTypeProvider {
         }
     }
 
-    func createImage(from image: LayerTree.Image) -> CGImage? {
+    func createImage(from image: LayerTree.Image) -> CGImageSource? {
+        let data: Data
         switch image.bitmap {
-        case .jpeg(let d):
-            return CGImage.from(data: d)
-        case .png(let d):
-            return CGImage.from(data: d)
+        case .jpeg(let d), .png(let d):
+            data = d
         }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              source.pixelSize != nil else { return nil }
+        return source
     }
 
-    func createSize(from image: CGImage) -> LayerTree.Size {
-        LayerTree.Size(
-            LayerTree.Float(image.width),
-            LayerTree.Float(image.height)
-        )
+    func createSize(from image: CGImageSource) -> LayerTree.Size {
+        let size = image.pixelSize ?? (0, 0)
+        return LayerTree.Size(LayerTree.Float(size.width), LayerTree.Float(size.height))
     }
 
     func getBounds(from shape: LayerTree.Shape) -> LayerTree.Rect {
@@ -319,16 +321,14 @@ struct CGProvider: RendererTypeProvider {
     }
 }
 
-//TODO: replace with CG implementation
-private extension CGImage {
-    static func from(data: Data) -> CGImage? {
-#if canImport(UIKit)
-        return UIImage(data: data)?.cgImage
-#elseif canImport(AppKit)
-        guard let image = NSImage(data: data) else { return nil }
-        var rect = NSRect(x: 0, y: 0, width: image.size.width, height: image.size.height)
-        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
-#endif
+extension CGImageSource {
+    // the first image's, read from its header
+    var pixelSize: (width: Int, height: Int)? {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(self, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0 else { return nil }
+        return (width, height)
     }
 }
 
@@ -351,7 +351,7 @@ struct CGRenderer: Renderer {
     // CGPattern matrices map to the context's base space, which CoreGraphics does not expose. PDF contexts and
     // bitmaps made with CoreGraphics, such as offscreen filter layers, have the identity: the CTM holds any
     // flip or placement by the caller. The base AppKit and UIKit set for a view or image is not known (nor
-    // what the caller did since): there the cells are drawn over each shape one by one.
+    // what the caller did since): there patterns are drawn through an offscreen bitmap.
     var tilesPatterns: Bool { filterLayers.context == nil && rootTilesPatterns }
 
     init(context: CGContext, maxFilterLayerPixels: Int = CGRenderer.defaultMaxFilterLayerPixels) {
@@ -363,24 +363,33 @@ struct CGRenderer: Renderer {
         self.rootContext = context
         self.rootIsVector = context.bitsPerPixel == 0
         self.rootTilesPatterns = !rootIsVector && context.isCurrentGraphicsContext
-        self.filterLayers = CGFilterLayerStack(drawing: drawing)
+        self.filterLayers = CGFilterLayerStack(drawing: drawing, keepsPatterns: rootTilesPatterns)
         self.maxFilterLayerPixels = maxFilterLayerPixels
     }
 
     func pushState() {
         ctx.saveGState()
+        filterLayers.saveState()
     }
 
     func popState() {
         ctx.restoreGState()
+        filterLayers.restoreState()
     }
 
+    // ending a transparency layer restores the graphics state it began with. A copy's layer past the
+    // drawing's budget is empty, and so is what the copy draws next
     func pushTransparencyLayer() {
+        if filterLayers.copies > 0, !canDrawCopy(covering: ctx.boundingBoxOfClipPath, perPixel: CGRenderer.layerPixelCost) {
+            ctx.clip(to: .zero)
+        }
         ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        filterLayers.saveState()
     }
 
     func popTransparencyLayer() {
         ctx.endTransparencyLayer()
+        filterLayers.restoreState()
     }
 
     func concatenate(transform: CGAffineTransform) {
@@ -400,7 +409,9 @@ struct CGRenderer: Renderer {
     }
 
     func setFill(color: CGColor) {
-        filterLayers.tiledPattern = nil
+        if rootTilesPatterns {
+            filterLayers.tiledPattern = nil
+        }
         ctx.setFillColor(color)
     }
 
@@ -410,64 +421,71 @@ struct CGRenderer: Renderer {
             return
         }
         // the pattern matrix maps to the base space, the identity here
-        let matrix = pattern.transform.concatenating(ctx.ctm)
-        // CoreGraphics draws the cell once per CGPattern, in a bitmap into a tile of its device size: shapes
-        // filled alike share one, and each new one is charged
-        let key: [AnyHashable] = [pattern, matrix.a, matrix.b, matrix.c, matrix.d, matrix.tx, matrix.ty]
-        if filterLayers.patterns[key] == nil {
-            let tile = isVector ? 0 : abs(matrix.a * matrix.d - matrix.b * matrix.c) * pattern.bounds.width * pattern.bounds.height
-            guard spend(cost: Double(pattern.contents.count * CGRenderer.patternCommandCost) + tile) else {
-                ctx.setFillColor(makeAverageColor(of: pattern))
-                return
-            }
-            let maxPixels = maxFilterLayerPixels
-            let drawing = filterLayers
-            filterLayers.patterns[key] = CGPattern.make(bounds: pattern.bounds,
-                                                        matrix: matrix,
-                                                        step: pattern.bounds.size,
-                                                        tiling: .constantSpacingMinimalDistortion,
-                                                        isColored: true,
-                                                        draw: { CGRenderer(context: $0, maxFilterLayerPixels: maxPixels, drawing: drawing).perform(pattern.contents) })
+        guard let cgPattern = makePattern(pattern, matrix: pattern.transform.concatenating(ctx.ctm)) else {
+            ctx.setFillColor(makeAverageColor(of: pattern))
+            return
         }
         var alpha: CGFloat = 1.0
         ctx.setFillColorSpace(CGColorSpace(patternBaseSpace: nil)!)
-        ctx.setFillPattern(filterLayers.patterns[key]!, colorComponents: &alpha)
+        ctx.setFillPattern(cgPattern, colorComponents: &alpha)
     }
 
-    // The cells over what of the path is visible, each clipped to its tile without antialiasing so that
-    // neighbours meet without a seam. Past the drawing's budget, the cells' average colour.
+    // CoreGraphics draws the cell once per CGPattern, in a bitmap into a tile of its device size: shapes filled
+    // alike share one, and each new one is charged. Nil past the drawing's budget.
+    private func makePattern(_ pattern: CGTransformingPattern, matrix: CGAffineTransform) -> CGPattern? {
+        let key: [AnyHashable] = [pattern, matrix.a, matrix.b, matrix.c, matrix.d, matrix.tx, matrix.ty]
+        if let cgPattern = filterLayers.patterns[key] {
+            return cgPattern
+        }
+        let tile = isVector ? 0 : abs(matrix.a * matrix.d - matrix.b * matrix.c) * pattern.bounds.width * pattern.bounds.height
+        guard spend(cost: Double(pattern.contents.count * CGRenderer.patternCommandCost) + tile) else { return nil }
+        let maxPixels = maxFilterLayerPixels
+        let drawing = filterLayers
+        let cgPattern = CGPattern.make(bounds: pattern.bounds,
+                                       matrix: matrix,
+                                       step: pattern.bounds.size,
+                                       tiling: .constantSpacingMinimalDistortion,
+                                       isColored: true,
+                                       draw: { CGRenderer(context: $0, maxFilterLayerPixels: maxPixels, drawing: drawing).perform(pattern.contents) })
+        filterLayers.patterns[key] = cgPattern
+        return cgPattern
+    }
+
+    // Where AppKit or UIKit draws, a CGPattern placed in device space fills an offscreen bitmap over what of
+    // the path is visible, a band of rows at a time, drawn back pixel for pixel through the path's clip.
+    // Past the drawing's budget, the cell's average colour.
     private func fill(path: CGPath, rule: CGPathFillRule, tiling pattern: CGTransformingPattern) {
-        let cell = pattern.bounds
         ctx.saveGState()
         defer { ctx.restoreGState() }
         ctx.addPath(path)
         ctx.clip(using: rule)
-        ctx.concatenate(pattern.transform)
-        let area = ctx.boundingBoxOfClipPath
-        guard !area.isNull, !area.isEmpty, !area.isInfinite, cell.width > 0, cell.height > 0 else { return }
-        // the cells a span of pattern space meets
-        func cells(_ min: CGFloat, _ max: CGFloat, start: CGFloat, size: CGFloat) -> ClosedRange<CGFloat> {
-            let first = ((min - start) / size).rounded(.down)
-            return first...Swift.max(first, ((max - start) / size).rounded(.up) - 1)
-        }
-        let columns = cells(area.minX, area.maxX, start: cell.minX, size: cell.width)
-        let rows = cells(area.minY, area.maxY, start: cell.minY, size: cell.height)
-        let tiles = (columns.upperBound - columns.lowerBound + 1) * (rows.upperBound - rows.lowerBound + 1)
-        guard spend(cost: tiles * Double((pattern.contents.count + 4) * CGRenderer.patternCommandCost)) else {
+        let toDevice = ctx.userSpaceToDeviceSpaceTransform
+        let visible = ctx.boundingBoxOfClipPath
+        guard !visible.isNull, !visible.isEmpty, !visible.isInfinite else { return }
+        let device = visible.applying(toDevice).integral
+        guard [device.minX, device.minY, device.width, device.height].allSatisfy(\.isFinite),
+              device.width >= 1, device.height >= 1 else { return }
+        let width = Int(device.width)
+        let rows = max(1, min(Int(device.height), CGRenderer.maxPatternBandPixels / width))
+        guard let cgPattern = makePattern(pattern, matrix: pattern.transform.concatenating(toDevice)),
+              let band = CGContext.makeFilterLayer(width: width, height: rows, colorSpace: ctx.colorSpace) else {
             ctx.setFillColor(makeAverageColor(of: pattern))
-            ctx.fill(area)
+            ctx.fill(visible)
             return
         }
-        let renderer = CGRenderer(context: ctx, maxFilterLayerPixels: maxFilterLayerPixels, drawing: filterLayers)
-        for row in stride(from: rows.lowerBound, through: rows.upperBound, by: 1) {
-            for column in stride(from: columns.lowerBound, through: columns.upperBound, by: 1) {
-                ctx.saveGState()
-                ctx.translateBy(x: column * cell.width, y: row * cell.height)
-                ctx.setShouldAntialias(false)
-                ctx.clip(to: cell)
-                ctx.setShouldAntialias(true)
-                renderer.perform(pattern.contents)
-                ctx.restoreGState()
+        var alpha: CGFloat = 1.0
+        band.setFillColorSpace(CGColorSpace(patternBaseSpace: nil)!)
+        band.setFillPattern(cgPattern, colorComponents: &alpha)
+        ctx.concatenate(toDevice.inverted())
+        ctx.interpolationQuality = .none
+        let bandRect = CGRect(x: 0, y: 0, width: width, height: rows)
+        for y in stride(from: device.minY, to: device.maxY, by: CGFloat(rows)) {
+            band.clear(bandRect)
+            // the band's pixels are device pixels offset by its origin
+            band.setPatternPhase(CGSize(width: -device.minX, height: -y))
+            band.fill(bandRect)
+            if let image = band.makeImage() {
+                ctx.draw(image, in: CGRect(x: device.minX, y: y, width: CGFloat(width), height: CGFloat(rows)))
             }
         }
     }
@@ -532,7 +550,7 @@ struct CGRenderer: Renderer {
     }
 
     func setClip(path: CGPath, rule: CGPathFillRule) {
-        guard canRasterize(path) else {
+        guard filterLayers.copies == 0 || canDrawCopy(of: path, cost: fillCost(of: path)) else {
             ctx.clip(to: .zero)
             return
         }
@@ -549,7 +567,8 @@ struct CGRenderer: Renderer {
     }
 
     func stroke(path: CGPath) {
-        guard canStroke(path) else { return }
+        guard filterLayers.copies == 0 || canDrawCopy(of: path, stroked: true, covering: strokeBounds(of: path),
+                                                     perPixel: CGRenderer.fillPixelCost, cost: strokeCost(of: path)) else { return }
         ctx.addPath(path)
         ctx.strokePath()
     }
@@ -558,7 +577,7 @@ struct CGRenderer: Renderer {
         ctx.addPath(path)
         ctx.replacePathWithStrokedPath()
         // the outline is made here: its cost is not kept
-        if !isVector, let outline = ctx.path, !spend(outline.rasterCost(transform: ctx.ctm)) {
+        if filterLayers.copies > 0, let outline = ctx.path, !spend(outline.rasterCost(transform: ctx.ctm), within: 2) {
             ctx.beginPath()
             ctx.clip(to: .zero)
             return
@@ -567,7 +586,8 @@ struct CGRenderer: Renderer {
     }
 
     func fill(path: CGPath, rule: CGPathFillRule) {
-        guard canRasterize(path) else { return }
+        guard filterLayers.copies == 0 || canDrawCopy(of: path, covering: path.boundingBoxOfPath,
+                                                     perPixel: CGRenderer.fillPixelCost, cost: fillCost(of: path)) else { return }
         if tilesPatterns, let pattern = filterLayers.tiledPattern {
             fill(path: path, rule: rule, tiling: pattern)
             return
@@ -576,17 +596,84 @@ struct CGRenderer: Renderer {
         ctx.fillPath(using: rule)
     }
 
-    func draw(image: CGImage, in rect: CGRect) {
+    func pushCopy() {
+        filterLayers.copies += 1
+    }
+
+    func popCopy() {
+        filterLayers.copies -= 1
+    }
+
+    // A copy multiplies what the document draws. The first draw of a path or image within copies is the
+    // document's own; each later one pays for the device pixels it covers within the clip, at `perPixel`
+    // nanoseconds, and `cost` more, within half the drawing's budget (building the copies took time already).
+    // False, charging nothing, past it. A vector context's device pixels are points: what its reader draws
+    // at a pixel per point.
+    private func canDrawCopy(of object: AnyObject? = nil, stroked: Bool = false, covering rect: CGRect = .null,
+                             perPixel: Double = 0, cost: @autoclosure () -> Int = 0) -> Bool {
+        if let object {
+            let id = ObjectIdentifier(object)
+            if stroked ? filterLayers.stroked.insert(id).inserted : filterLayers.filled.insert(id).inserted {
+                return true
+            }
+        }
+        let visible = rect.intersection(ctx.boundingBoxOfClipPath)
+        let t = ctx.userSpaceToDeviceSpaceTransform
+        let pixels = visible.isNull ? 0 : abs(t.a * t.d - t.b * t.c) * visible.width * visible.height
+        return spend(cost: perPixel * Double(pixels) + Double(cost()), within: 2)
+    }
+
+    private func fillCost(of path: CGPath) -> Int {
+        CGPath.fillCost(of: filterLayers.rasterEdges(of: path, transform: ctx.ctm))
+    }
+
+    private func strokeCost(of path: CGPath) -> Int {
+        let t = ctx.ctm
+        let scale = abs(t.a * t.d - t.b * t.c).squareRoot()
+        return CGPath.strokeCost(of: filterLayers.rasterEdges(of: path, transform: t),
+                                 width: filterLayers.lineWidth * scale, scale: scale)
+    }
+
+    // what a stroke can cover: the path grown by its width on each side, for miters and square caps
+    private func strokeBounds(of path: CGPath) -> CGRect {
+        let width = filterLayers.lineWidth
+        return path.boundingBoxOfPath.insetBy(dx: -width, dy: -width)
+    }
+
+    func draw(image: CGImageSource, in rect: CGRect) {
+      guard filterLayers.copies == 0 || canDrawCopy(of: image, covering: rect, perPixel: CGRenderer.imagePixelCost),
+            let decoded = makeImage(image, drawnIn: rect) else { return }
       pushState()
       translate(tx: rect.minX, ty: rect.maxY)
       scale(sx: 1, sy: -1)
       pushState()
-      ctx.draw(image, in: CGRect(origin: .zero, size: rect.size))
+      ctx.draw(decoded, in: CGRect(origin: .zero, size: rect.size))
       popState()
       popState()
     }
 
+    // ImageIO keeps what it decodes in the source. An image with more pixels than a floor and four times what
+    // the device has where it is drawn (300 ppi in vector contexts) is decoded at that size, rounded up to a
+    // power of two so that nearby sizes share it: a large image costs what it draws, not what it holds.
+    func makeImage(_ source: CGImageSource, drawnIn rect: CGRect) -> CGImage? {
+        guard let (width, height) = source.pixelSize else { return nil }
+        let device = rect.applying(ctx.userSpaceToDeviceSpaceTransform)
+        let scale = isVector ? CGRenderer.vectorOversample : 1
+        let side = max(device.width, device.height) * scale
+        let needed = Double(device.width * device.height * scale * scale)
+        guard side.isFinite else { return nil }
+        guard Double(width) * Double(height) > max(Double(CGRenderer.minDecodedPixels), 4 * needed) else {
+            return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: true] as CFDictionary)
+        }
+        let maxSide = 1 << Int(log2(max(1, Double(side))).rounded(.up))
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                               kCGImageSourceThumbnailMaxPixelSize: maxSide,
+                                                               kCGImageSourceShouldCache: true,
+                                                               kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+    }
+
     func draw(linear gradient: CGGradient, from start: CGPoint, to end: CGPoint) {
+        guard filterLayers.copies == 0 || canDrawCopy(covering: ctx.boundingBoxOfClipPath, perPixel: CGRenderer.gradientPixelCost) else { return }
         ctx.drawLinearGradient(gradient,
                                start: start,
                                end: end,
@@ -595,6 +682,7 @@ struct CGRenderer: Renderer {
     }
 
     func draw(radial gradient: CGGradient, startCenter: CGPoint, startRadius: CGFloat, endCenter: CGPoint, endRadius: CGFloat) {
+        guard filterLayers.copies == 0 || canDrawCopy(covering: ctx.boundingBoxOfClipPath, perPixel: CGRenderer.gradientPixelCost) else { return }
         ctx.drawRadialGradient(gradient,
                                startCenter: startCenter,
                                startRadius: startRadius,
@@ -622,6 +710,9 @@ struct CGRenderer: Renderer {
         let visible = parent.boundingBoxOfClipPath
 
         parent.saveGState()
+        // the offscreen starts from a fresh graphics state, as the command optimizer expects
+        filterLayers.saveState()
+        filterLayers.resetState()
         parent.clip(to: region)
 
         // empty clip: draw nothing and allocate nothing
@@ -708,6 +799,7 @@ struct CGRenderer: Renderer {
 
         // removes the region clip set by pushFilterLayer
         parent.restoreGState()
+        filterLayers.restoreState()
     }
 
     // PDF and other vector contexts cannot express masks: the contents stay vector, clipped to the
@@ -730,6 +822,7 @@ struct CGRenderer: Renderer {
             return
         }
         parent.saveGState()
+        filterLayers.saveState()
         var isSoft = false
         defer {
             filterLayers.maskGroups.append(isSoft)
@@ -762,6 +855,7 @@ struct CGRenderer: Renderer {
             ctx.endTransparencyLayer()
         }
         ctx.restoreGState()
+        filterLayers.restoreState()
     }
 
     // The alpha the mask draws, as a DeviceGray image (clip(to:mask:) takes its gray as alpha), its rect
@@ -848,29 +942,17 @@ struct CGRenderer: Renderer {
             (maxFilterLayerPixels * CGRenderer.drawBudgetLayers - filterLayers.spentPasses) / max(1, passes))
     }
 
-    // Whether the drawing can afford rasterising `path`, charged if so; vector contexts write it out as it is
-    private func canRasterize(_ path: CGPath) -> Bool {
-        isVector || spend(CGPath.fillCost(of: filterLayers.rasterEdges(of: path, transform: ctx.ctm)))
-    }
-
-    private func canStroke(_ path: CGPath) -> Bool {
-        guard !isVector else { return true }
-        let t = ctx.ctm
-        let scale = abs(t.a * t.d - t.b * t.c).squareRoot()
-        return spend(CGPath.strokeCost(of: filterLayers.rasterEdges(of: path, transform: t),
-                                       width: filterLayers.lineWidth * scale, scale: scale))
-    }
-
-    // Charges `cost` to the drawing's budget; false, charging nothing, when what is left cannot pay it
-    private func spend(_ cost: Int) -> Bool {
+    // Charges `cost` to the drawing's budget; false, charging nothing, when what is left of the first
+    // 1 / `share` of it cannot pay it
+    private func spend(_ cost: Int, within share: Int = 1) -> Bool {
         guard cost > 0 else { return true }
-        guard cost <= maxFilterLayerPixels * CGRenderer.drawBudgetLayers - filterLayers.spentPasses else { return false }
+        guard cost <= maxFilterLayerPixels * CGRenderer.drawBudgetLayers / share - filterLayers.spentPasses else { return false }
         filterLayers.spend(cost)
         return true
     }
 
-    private func spend(cost: Double) -> Bool {
-        cost.isFinite && cost < Double(Int.max / 2) && spend(Int(cost))
+    private func spend(cost: Double, within share: Int = 1) -> Bool {
+        cost.isFinite && cost < Double(Int.max / 2) && spend(Int(cost), within: share)
     }
 
     // Whether a bitmap within maxPixels is worth drawing: all of the rect, or at least a floor of pixels
@@ -881,9 +963,10 @@ struct CGRenderer: Renderer {
     }
 
     static let defaultMaxFilterLayerPixels = 16_777_216
-    // A drawing's budget for rasterising, in units of about a nanosecond: this many passes over a full-budget
-    // layer, about 1 s. A pass over a pixel (drawing it, a box blur, a flood) costs 0.3–1 ns; filter primitives
-    // also pay for the pixels they work out one by one, and paths for their raster cost.
+    // A drawing's budget for what it multiplies, in units of about a nanosecond: this many passes over a
+    // full-budget layer, about 1 s. A pass over a pixel (drawing it, a box blur, a flood) costs 0.3–1 ns; filter
+    // primitives also pay for the pixels they work out one by one, pattern cells for their commands, and copies
+    // for their pixels and paths. The document's own shapes, text and images are not charged.
     static let drawBudgetLayers = 64
     // below this fraction of the budget a layer that needs more is not rasterised
     static let minFilterLayerFraction = 256
@@ -892,32 +975,73 @@ struct CGRenderer: Renderer {
     static let maskProbePixels = 65_536
     // a pattern cell's command, drawn or written out: measured at 0.3 µs in bitmaps and 0.4 µs in PDF
     static let patternCommandCost = 400
+    // the most pixels of a band an offscreen pattern fill draws at once
+    static let maxPatternBandPixels = 1 << 22
+    // images up to this many pixels are decoded whole (16 MB at 4 bytes a pixel)
+    static let minDecodedPixels = 1 << 22
+    // nanoseconds per device pixel a copy pays, measured on a 1600 × 1200 bitmap: a translucent fill or
+    // stroke 2.3, a gradient 5–7, a transformed image 6, a transparency layer 7
+    static let fillPixelCost = 2.5
+    static let gradientPixelCost = 7.0
+    static let imagePixelCost = 6.0
+    static let layerPixelCost = 7.0
 }
 
 final class CGFilterLayerStack {
-    var entries = [CGFilterLayer]()
+    var entries = [CGFilterLayer]() {
+        didSet { context = entries.last(where: { $0.offscreen != nil })?.offscreen }
+    }
+    // the innermost offscreen, kept as entries change: every command draws into it
+    private(set) var context: CGContext?
     // the drawing a pattern cell or mask is drawn for: its offscreens stay alive and its budget is shared
     let drawing: CGFilterLayerStack?
     private var spent = 0
     // the patterns made in this context, by pattern and matrix
     var patterns = [[AnyHashable]: CGPattern]()
-    // the pattern following fills draw cell by cell, where CGPatterns would be misplaced
-    var tiledPattern: CGTransformingPattern?
     // for each PDF mask pushed, whether its contents are drawn as one group
     var maskGroups = [Bool]()
     // what each pattern cell's contents average to, for the whole drawing
     var averageColors = [CGTransformingPattern: CGColor]()
 
+    // What the renderer keeps beside CoreGraphics' graphics state, saved and restored with it: the command
+    // optimizer drops a setting the restored state already holds. The pattern following fills draw offscreen,
+    // where CGPatterns would be misplaced, is only kept where AppKit or UIKit draws.
+    var lineWidth: CGFloat = 1
+    var tiledPattern: CGTransformingPattern?
+    private var savedWidths = [CGFloat]()
+    private var savedPatterns = [CGTransformingPattern?]()
+    private let keepsPatterns: Bool
+    // how many copies the commands drawn are within, and the paths and images drawn in them so far
+    var copies = 0
+    var filled = Set<ObjectIdentifier>()
+    var stroked = Set<ObjectIdentifier>()
+
+    func saveState() {
+        savedWidths.append(lineWidth)
+        if keepsPatterns {
+            savedPatterns.append(tiledPattern)
+        }
+    }
+
+    func restoreState() {
+        lineWidth = savedWidths.popLast() ?? 1
+        if keepsPatterns {
+            tiledPattern = savedPatterns.popLast() ?? nil
+        }
+    }
+
+    func resetState() {
+        lineWidth = 1
+        tiledPattern = nil
+    }
+
     var root: CGFilterLayerStack {
         drawing?.root ?? self
     }
 
-    init(drawing: CGFilterLayerStack? = nil) {
+    init(drawing: CGFilterLayerStack? = nil, keepsPatterns: Bool = false) {
         self.drawing = drawing
-    }
-
-    var context: CGContext? {
-        entries.last(where: { $0.offscreen != nil })?.offscreen
+        self.keepsPatterns = keepsPatterns
     }
 
     var livePixels: Int {
@@ -953,9 +1077,6 @@ final class CGFilterLayerStack {
         rasterEdges[ObjectIdentifier(path)] = (path, linear, edges)
         return edges
     }
-
-    // the line width last set: the generator sets it before each stroke
-    var lineWidth: CGFloat = 1
 }
 
 struct CGFilterLayer {

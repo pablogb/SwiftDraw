@@ -31,6 +31,7 @@
 
 #if canImport(CoreGraphics)
 import CoreGraphics
+import ImageIO
 
 extension [RendererCommand<CGTypes>] {
 
@@ -62,8 +63,9 @@ extension CGPath {
     }
 }
 
-extension CGImage {
-    var estimatedCost: Int { bytesPerRow * height }
+extension CGImageSource {
+    // decoded whole, at 4 bytes a pixel
+    var estimatedCost: Int { pixelSize.map { $0.width * $0.height * 4 } ?? 0 }
 }
 
 extension RendererCommand<CGTypes> {
@@ -85,7 +87,7 @@ extension RendererCommand<CGTypes> {
         }
     }
 
-    var allImages: [CGImage] {
+    var allImages: [CGImageSource] {
         switch self {
         case .setFillPattern(let p):
             return p.contents.allImages
@@ -107,8 +109,8 @@ extension [RendererCommand<CGTypes>] {
         return paths
     }
 
-    var allImages: [CGImage] {
-        var images = [CGImage]()
+    var allImages: [CGImageSource] {
+        var images = [CGImageSource]()
         for command in self {
             images.append(contentsOf: command.allImages)
         }

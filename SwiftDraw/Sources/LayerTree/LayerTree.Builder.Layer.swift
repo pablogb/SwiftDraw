@@ -58,6 +58,7 @@ extension LayerTree.Builder {
         }
 
         let l = makeLayer(from: element, inheriting: state, ancestors: ancestors + [id])
+        l.isCopy = true
         let x = use.x ?? 0.0
         let y = use.y ?? 0.0
 

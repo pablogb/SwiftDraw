@@ -69,7 +69,7 @@ extension LayerTree.Builder {
 
     /// `bounds` is the bounding box of the referencing element, evaluated only for objectBoundingBox units.
     /// Resolved once per clip path and box; each element it clips pays for drawing its members again,
-    /// and past the document-wide budget is clipped away.
+    /// and past the document-wide budget is drawn unclipped rather than lost.
     func makeClip(id: String, bounds: () -> LayerTree.Rect?) -> Clip? {
         // within a clip path being resolved, a cycle or the nesting cap depends on the path taken there
         guard activeClips.count == 0 else { return resolveClip(id: id, bounds: bounds) }
@@ -93,9 +93,7 @@ extension LayerTree.Builder {
             return (clip, resolved.clipCost)
         }()
         resolved.clips[key] = resolution
-        guard resolution.clip != nil, references.spend(resolution.cost) else {
-            return resolution.clip.map { _ in .shapes([.empty], .nonzero) }
-        }
+        guard references.spend(resolution.cost) else { return nil }
         return resolution.clip
     }
 

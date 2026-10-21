@@ -39,13 +39,14 @@ extension LayerTree {
     struct Builder {
 
         let svg: DOM.SVG
-        let references = ReferenceGuard()
+        let references: ReferenceGuard
         let activeClips = ActiveClipSet()
         let measurement = MeasurementBudget()
         let resolved = ResolvedDefs()
 
         init(svg: DOM.SVG) {
             self.svg = svg
+            self.references = ReferenceGuard(documentSize: { ReferenceGuard.size(of: svg) })
         }
 
         func makeLayer() -> Layer {
@@ -1063,25 +1064,35 @@ extension LayerTree.Builder {
     /// levels: it recurses natively through the builder, about 6 KB of stack (10 KB in debug builds),
     /// where a group level costs well under 1 KB, only when the tree is released.
     ///
-    /// `maxElements` caps the cost of the elements built inside `<use>`, mask and pattern contents: once
-    /// it is spent their expansion stops (non-cyclic fan-out such as 10 uses of 10 uses is exponential).
-    /// An element costs one, about 5 µs to build, generate and draw, plus its size (`cost(of:)`). The
-    /// document's own elements, bounded by its size, are always built.
+    /// The budget caps the cost of the elements built inside `<use>`, mask and pattern contents, and of the
+    /// clip path members each clipped element draws again: once it is spent their expansion stops (non-cyclic
+    /// fan-out such as 10 uses of 10 uses is exponential) and clip paths are not applied. An element costs one,
+    /// about 5 µs to build, generate and draw, plus its size (`cost(of:)`). It is `minElements`, and past it
+    /// `documentMultiple` times the document's own size, so it bounds how much a document multiplies itself,
+    /// not how large it is: its own elements are always built.
     ///
     /// Any new walk over a reference chain that re-enters `<use>`, mask or pattern expansion must call this.
     /// Gradient and pattern `href` chains do not: they are bounded by `maxGradientHops`.
     final class ReferenceGuard {
         static let maxDepth = 200
         static let referenceDepth = 12
-        static let maxElements = 250_000
+        static let minElements = 250_000
+        static let documentMultiple = 32
         private var active = Set<String>()
         /// the depth of the elements built next
         var level = 0
         private(set) var elements = 0
+        private(set) var maxElements = ReferenceGuard.minElements
+        /// asked once, when `minElements` is spent
+        private var documentSize: (() -> Int)?
+
+        init(documentSize: (() -> Int)? = nil) {
+            self.documentSize = documentSize
+        }
 
         func enter(_ key: String) -> Bool {
             guard level + Self.referenceDepth < Self.maxDepth,
-                  elements < Self.maxElements,
+                  canAfford(1),
                   active.insert(key).inserted else { return false }
             level += Self.referenceDepth
             return true
@@ -1100,9 +1111,35 @@ extension LayerTree.Builder {
 
         /// Counts `cost` inside a reference or not; false when the budget cannot pay it.
         func spend(_ cost: Int) -> Bool {
-            guard cost <= Self.maxElements - elements else { return false }
+            guard canAfford(cost) else { return false }
             elements += cost
             return true
+        }
+
+        private func canAfford(_ cost: Int) -> Bool {
+            if cost > maxElements - elements, let documentSize {
+                self.documentSize = nil
+                maxElements += Self.documentMultiple * min(documentSize(), Int.max / 2 / Self.documentMultiple)
+            }
+            return cost <= maxElements - elements
+        }
+
+        /// The size of the document's own elements, those it draws and those its defs, clip paths, masks and
+        /// patterns hold, in elements: one each, and an eighth per path segment, point or character, about a
+        /// coordinate in the file. A character costs more to copy than its size (`cost(of:)`).
+        static func size(of svg: DOM.SVG) -> Int {
+            var pending = svg.childElements + Array(svg.defs.elements.values)
+            pending += svg.defs.clipPaths.flatMap(\.childElements)
+            pending += svg.defs.masks.flatMap(\.childElements)
+            pending += svg.defs.patterns.flatMap(\.childElements)
+            var total = 0
+            while let element = pending.popLast() {
+                total += (element as? DOM.Text).map { 1 + $0.value.utf16.count / 8 } ?? cost(of: element)
+                if let container = element as? any ContainerElement {
+                    pending.append(contentsOf: container.childElements)
+                }
+            }
+            return total
         }
 
         /// What a copy of `element` costs, in elements: one, plus about 0.5 µs per path segment or point

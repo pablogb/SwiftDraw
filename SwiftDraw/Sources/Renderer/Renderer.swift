@@ -108,6 +108,9 @@ protocol Renderer {
 
     func pushMask(_ mask: [RendererCommand<Types>], bounds: Types.Rect?)
     func popMask(_ composite: [RendererCommand<Types>])
+
+    func pushCopy()
+    func popCopy()
 }
 
 extension Renderer {
@@ -120,6 +123,9 @@ extension Renderer {
         perform(composite)
         popTransparencyLayer()
     }
+
+    func pushCopy() { }
+    func popCopy() { }
 }
 
 extension Renderer {
@@ -183,6 +189,10 @@ extension Renderer {
             pushMask(mask, bounds: bounds)
         case .popMask(let composite):
             popMask(composite)
+        case .pushCopy:
+            pushCopy()
+        case .popCopy:
+            popCopy()
         }
     }
 
@@ -235,6 +245,11 @@ enum RendererCommand<Types: RendererTypes>: @unchecked Sendable {
     // `bounds`, when known, holds all the contents draw, in the current user space
     case pushMask([RendererCommand<Types>], bounds: Types.Rect?)
     case popMask([RendererCommand<Types>])
+
+    // the following commands until popCopy draw a copy made by reference (`<use>`): a small document
+    // can multiply what they draw, so renderers may bound it
+    case pushCopy
+    case popCopy
 }
 
 

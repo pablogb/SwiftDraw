@@ -189,7 +189,9 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
         body += ##"</defs><use xlink:href="#l3"/>"##
         let builder = LayerTree.Builder(svg: try makeSVG(body))
         let s = Self.stats(of: builder.makeLayer())
-        let budget = LayerTree.Builder.ReferenceGuard.maxElements
+        // the floor, and 32 times the document's own size: 1035 elements
+        let budget = builder.references.maxElements
+        XCTAssertEqual(budget, LayerTree.Builder.ReferenceGuard.minElements + 32 * 1_035)
         XCTAssertEqual(builder.references.elements, budget)
         // every element counted built at most one shape; then copying stopped
         XCTAssertLessThanOrEqual(s.shapes, budget)
@@ -206,7 +208,7 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
         body += ##"</defs><use xlink:href="#l4"/>"##
         let builder = LayerTree.Builder(svg: try makeSVG(body))
         let s = Self.stats(of: builder.makeLayer())
-        let copies = LayerTree.Builder.ReferenceGuard.maxElements / 101
+        let copies = builder.references.maxElements / 101
         XCTAssertLessThanOrEqual(s.shapes, copies)
         XCTAssertGreaterThan(s.shapes, copies * 9 / 10)
     }
@@ -218,8 +220,9 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
             body += ##"<g id="l\##(i)">"## + String(repeating: ##"<use xlink:href="#l\##(i - 1)"/>"##, count: 10) + "</g>"
         }
         body += ##"</defs><use xlink:href="#l3"/>"##
-        let s = try stats(body)
-        let copies = LayerTree.Builder.ReferenceGuard.maxElements / 1001
+        let builder = LayerTree.Builder(svg: try makeSVG(body))
+        let s = Self.stats(of: builder.makeLayer())
+        let copies = builder.references.maxElements / 1001
         XCTAssertLessThanOrEqual(s.texts, copies)
         XCTAssertGreaterThan(s.texts, copies * 9 / 10)
     }

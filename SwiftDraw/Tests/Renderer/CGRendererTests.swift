@@ -182,54 +182,132 @@ final class CGRendererTests: XCTestCase {
     XCTAssertEqual(renderer.getColor(x: 1, y: 1), .red)
   }
 
-  func testPathTooCostlyToRasterizeIsNeitherFilledNorClippedTo() throws {
-    // 3000 edges crossing each other: seconds of antialiasing, more than the drawing's budget
-    let scribble = CGPathSegmentTests.scribble(segments: 3_000)
-    let bitmap = try XCTUnwrap(CGContext(data: nil, width: 100, height: 100, bitsPerComponent: 8, bytesPerRow: 0,
-                                         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
-    let renderer = CGRenderer(context: bitmap)
-    renderer.perform([
-      .setFill(color: CGColor(gray: 0, alpha: 1)),
-      .fill(CGPath(rect: CGRect(x: 0, y: 0, width: 10, height: 10), transform: nil), rule: .winding),
-      .fill(scribble, rule: .winding),
-      .pushState,
-      .setClip(path: scribble, rule: .winding),
-      .fill(CGPath(rect: CGRect(x: 0, y: 0, width: 100, height: 100), transform: nil), rule: .winding),
-      .popState
-    ])
-    let data = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
-    let drawn = (0..<100).flatMap { y in (0..<100).map { x in data[y * bitmap.bytesPerRow + x * 4 + 3] } }.filter { $0 != 0 }
-    // only the square
-    XCTAssertEqual(drawn.count, 100)
-    XCTAssertEqual(renderer.filterLayers.spentPasses, 0)
-
-    // a PDF writes it out
-    let pdfData = NSMutableData()
-    var box = CGRect(x: 0, y: 0, width: 100, height: 100)
-    let pdf = try XCTUnwrap(CGContext(consumer: try XCTUnwrap(CGDataConsumer(data: pdfData as CFMutableData)), mediaBox: &box, nil))
-    pdf.beginPDFPage(nil)
-    CGRenderer(context: pdf).perform([.setFill(color: CGColor(gray: 0, alpha: 1)), .fill(scribble, rule: .winding)])
-    pdf.endPDFPage()
-    pdf.closePDF()
-    XCTAssertGreaterThan(pdfData.length, 3_000 * 8)
-  }
-
-  func testWideStrokesPastTheBudgetAreNotDrawn() throws {
-    // 3000 crossing edges stroked 4 px wide: about 0.1 s each, so 20 copies are more than the drawing's budget
-    let scribble = CGPathSegmentTests.scribble(segments: 3_000)
+  /// Twenty copies of a 300-segment scribble stroked 4 px wide, side by side, each in a 100 px square:
+  /// which of them drew, with the drawing's budget at 64 × 100 000 (each stroke is estimated at 0.9 ms;
+  /// copies may spend half).
+  func renderScribbles(asCopies: Bool) throws -> (Int) -> Bool {
+    let scribble = CGPathSegmentTests.scribble(segments: 300)
     let bitmap = try XCTUnwrap(CGContext(data: nil, width: 2_000, height: 100, bitsPerComponent: 8, bytesPerRow: 0,
                                          space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
-    var commands: [RendererCommand<CGTypes>] = [.setStroke(color: CGColor(gray: 0, alpha: 1)), .setLine(width: 4)]
+    var commands: [RendererCommand<CGTypes>] = [.setStroke(color: CGColor(gray: 0, alpha: 1)), .setLine(width: 4),
+                                                .setFill(color: CGColor(gray: 0, alpha: 1))]
     for copy in 0..<20 {
-      commands += [.pushState, .translate(tx: CGFloat(copy) * 100, ty: 0), .stroke(scribble), .popState]
+      let place: [RendererCommand<CGTypes>] = [.pushState, .translate(tx: CGFloat(copy) * 100, ty: 0), .stroke(scribble), .popState]
+      commands += asCopies ? [.pushCopy] + place + [.popCopy] : place
     }
-    CGRenderer(context: bitmap).perform(commands)
+    CGRenderer(context: bitmap, maxFilterLayerPixels: 100_000).perform(commands)
     let data = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
-    func isDrawn(_ copy: Int) -> Bool {
+    return { copy in
       (0..<100).contains { y in (copy * 100..<copy * 100 + 100).contains { x in data[y * bitmap.bytesPerRow + x * 4 + 3] != 0 } }
     }
-    XCTAssertTrue(isDrawn(0))
-    XCTAssertFalse(isDrawn(19))
+  }
+
+  func testWideStrokesOfTheDocumentAreAllDrawn() throws {
+    let isDrawn = try renderScribbles(asCopies: false)
+    XCTAssertTrue((0..<20).allSatisfy(isDrawn))
+  }
+
+  func testWideStrokesOfCopiesPastTheBudgetAreNotDrawn() throws {
+    // the first is the document's own; each later one is charged its edges and pixels
+    let isDrawn = try renderScribbles(asCopies: true)
+    XCTAssertTrue((0..<4).allSatisfy(isDrawn))
+    XCTAssertFalse((4..<20).contains(where: isDrawn))
+  }
+
+  /// Translucent 100 × 100 px squares, each the whole bitmap: `count` of the document's own, or 100 copies as
+  /// nested <use>s. The alpha they add up to, with the drawing's budget at 64 × 10 000 (copies may spend half),
+  /// drawn into the bitmap or into a PDF page of 100 × 100 points then drawn into it.
+  func renderTranslucentSquares(_ fill: String, count: Int? = nil, pdf: Bool = false) throws -> UInt8 {
+    let square = ##"<rect width="100" height="100" fill="\##(fill)" fill-opacity="0.01"/>"##
+    let body = count.map { String(repeating: square, count: $0) }
+      ?? ##"<defs>\##(square.replacingOccurrences(of: "<rect", with: ##"<rect id="r""##))<g id="ten">"## +
+        String(repeating: ##"<use href="#r"/>"##, count: 10) + "</g></defs>" + String(repeating: ##"<use href="#ten"/>"##, count: 10)
+    let svg = try XCTUnwrap(SVG(xml: """
+    <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+    <defs><linearGradient id="g"><stop offset="0" stop-color="black"/><stop offset="1" stop-color="black"/></linearGradient></defs>
+    \(body)
+    </svg>
+    """))
+    let bitmap = try XCTUnwrap(CGContext(data: nil, width: 100, height: 100, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    if pdf {
+      let data = NSMutableData()
+      var box = CGRect(x: 0, y: 0, width: 100, height: 100)
+      let context = try XCTUnwrap(CGContext(consumer: try XCTUnwrap(CGDataConsumer(data: data as CFMutableData)), mediaBox: &box, nil))
+      context.beginPDFPage(nil)
+      CGRenderer(context: context, maxFilterLayerPixels: 10_000).perform(svg.commands)
+      context.endPDFPage()
+      context.closePDF()
+      bitmap.drawPDFPage(try XCTUnwrap(CGPDFDocument(try XCTUnwrap(CGDataProvider(data: data as CFData)))?.page(at: 1)))
+    } else {
+      CGRenderer(context: bitmap, maxFilterLayerPixels: 10_000).perform(svg.commands)
+    }
+    return try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)[50 * bitmap.bytesPerRow + 50 * 4 + 3]
+  }
+
+  func testCopiesOfLargeAreasAreChargedTheirPixels() throws {
+    // filled at 2.5 ns a pixel, 12 copies are charged after the first, the document's own; gradients
+    // (7 ns a pixel) are all charged: 4 copies. The document's own squares are not
+    XCTAssertEqual(try renderTranslucentSquares("black"), try renderTranslucentSquares("black", count: 13))
+    XCTAssertEqual(try renderTranslucentSquares("url(#g)"), try renderTranslucentSquares("url(#g)", count: 4))
+    XCTAssertGreaterThan(try renderTranslucentSquares("black", count: 100), try renderTranslucentSquares("black", count: 99))
+    // a PDF holds what its reader draws at a pixel per point
+    XCTAssertEqual(try renderTranslucentSquares("black", pdf: true), try renderTranslucentSquares("black", count: 13, pdf: true))
+  }
+
+  func testLineWidthIsRestoredWithTheGraphicsState() throws {
+    // the optimizer drops a width the restored state holds: what copies' strokes are charged follows CoreGraphics
+    let bitmap = try XCTUnwrap(CGContext(data: nil, width: 10, height: 10, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    let renderer = CGRenderer(context: bitmap)
+    renderer.perform([.setLine(width: 2), .pushState, .setLine(width: 9), .popState])
+    XCTAssertEqual(renderer.filterLayers.lineWidth, 2)
+    renderer.perform([.pushTransparencyLayer, .setLine(width: 9), .popTransparencyLayer])
+    XCTAssertEqual(renderer.filterLayers.lineWidth, 2)
+  }
+
+  func testLargeImageIsDecodedAtTheSizeItIsDrawn() throws {
+    // 4000 × 2000 grey pixels drawn 100 × 50 points: 128 pixels wide in a bitmap, at least 300 ppi in a PDF
+    let image = try XCTUnwrap(CGContext(data: nil, width: 4_000, height: 2_000, bitsPerComponent: 8, bytesPerRow: 0,
+                                        space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue))
+    image.setFillColor(gray: 0.5, alpha: 1)
+    image.fill(CGRect(x: 0, y: 0, width: 4_000, height: 2_000))
+    let png = NSMutableData()
+    let destination = try XCTUnwrap(CGImageDestinationCreateWithData(png, "public.png" as CFString, 1, nil))
+    CGImageDestinationAddImage(destination, try XCTUnwrap(image.makeImage()), nil)
+    XCTAssertTrue(CGImageDestinationFinalize(destination))
+    let source = try XCTUnwrap(CGProvider().createImage(from: LayerTree.Image(bitmap: .png(png as Data))))
+    XCTAssertEqual(CGProvider().createSize(from: source), LayerTree.Size(4_000, 2_000))
+
+    let bitmap = try XCTUnwrap(CGContext(data: nil, width: 100, height: 50, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    let drawn = CGRect(x: 0, y: 0, width: 100, height: 50)
+    XCTAssertEqual(CGRenderer(context: bitmap).makeImage(source, drawnIn: drawn)?.width, 128)
+    bitmap.scaleBy(x: 40, y: 40)
+    XCTAssertEqual(CGRenderer(context: bitmap).makeImage(source, drawnIn: drawn)?.width, 4_000)
+
+    let pdfData = NSMutableData()
+    var box = drawn
+    let pdf = try XCTUnwrap(CGContext(consumer: try XCTUnwrap(CGDataConsumer(data: pdfData as CFMutableData)), mediaBox: &box, nil))
+    pdf.beginPDFPage(nil)
+    XCTAssertEqual(CGRenderer(context: pdf).makeImage(source, drawnIn: drawn)?.width, 512)
+    pdf.endPDFPage()
+    pdf.closePDF()
+
+    // drawn where it is placed
+    let svg = try XCTUnwrap(SVG(xml: """
+    <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="50">
+    <image width="100" height="50" xlink:href="data:image/png;base64,\((png as Data).base64EncodedString())"/>
+    </svg>
+    """))
+    let canvas = try XCTUnwrap(CGContext(data: nil, width: 100, height: 50, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    canvas.draw(svg)
+    let pixels = try XCTUnwrap(canvas.data).assumingMemoryBound(to: UInt8.self)
+    for (x, y) in [(1, 1), (50, 25), (98, 48)] {
+      XCTAssertEqual(pixels[y * canvas.bytesPerRow + x * 4 + 3], 255)
+      XCTAssertEqual(Int(pixels[y * canvas.bytesPerRow + x * 4]), 128, accuracy: 2)
+    }
   }
 
   func testTextIsLaidOutOncePerStringAndPlace() {

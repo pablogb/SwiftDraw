@@ -203,34 +203,97 @@ extension CGPatternTests {
         </svg>
         """))
         for scale in [1, 2] as [CGFloat] {
-            let view = PageView(svg: svg, inset: CGPoint(x: 7, y: 9), scale: scale)
-            let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-            view.cacheDisplay(in: view.bounds, to: rep)
+            XCTAssertEqual(try mismatchesOfAFlippedView(svg, scale: scale), 0, "scale \(scale)")
+        }
+    }
 
-            // the same page in a plain bitmap, placed as the view places it
-            let width = rep.pixelsWide
-            let height = rep.pixelsHigh
-            let pixelsPerPoint = CGFloat(width) / view.bounds.width
-            let bitmap = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+    @MainActor
+    func testPatternInAFlippedViewDoesNotFillLaterShapes() throws {
+        // a hatched square in a group, between two black ones: the third was hatched where AppKit draws
+        let svg = try XCTUnwrap(SVG(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="60" height="20">
+            <defs><pattern id="h" patternUnits="userSpaceOnUse" width="4" height="4"><rect width="2" height="4" fill="red"/></pattern></defs>
+            <rect x="0" y="0" width="20" height="20" fill="blue"/>
+            <g transform="translate(20 0)"><rect width="20" height="20" fill="url(#h)"/></g>
+            <rect x="40" y="0" width="20" height="20" fill="blue"/>
+        </svg>
+        """))
+        for scale in [1, 2] as [CGFloat] {
+            XCTAssertEqual(try mismatchesOfAFlippedView(svg, scale: scale), 0, "scale \(scale)")
+        }
+    }
+
+    @MainActor
+    func testPatternWhereAppKitDrawsIsMadeOnceNotTiledByHand() throws {
+        // dots of 2 × 2 over a page, a rotated rect and a circle: 7500 tiles each were drawn one by one
+        let svg = try XCTUnwrap(SVG(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="200" height="150">
+            <defs><pattern id="d" patternUnits="userSpaceOnUse" width="2" height="2"><circle cx="1" cy="1" r="0.5" fill="blue"/></pattern></defs>
+            <rect width="200" height="150" fill="url(#d)"/>
+            <rect x="25" y="25" width="150" height="100" fill="url(#d)" transform="rotate(10 100 75)"/>
+            <circle cx="100" cy="75" r="60" fill="url(#d)"/>
+        </svg>
+        """))
+        func render(current: Bool) throws -> (bytes: [UInt8], spent: Int) {
+            let bitmap = try XCTUnwrap(CGContext(data: nil, width: 400, height: 300, bitsPerComponent: 8, bytesPerRow: 1_600,
                                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
-            bitmap.translateBy(x: 0, y: CGFloat(height))
-            bitmap.scaleBy(x: pixelsPerPoint, y: -pixelsPerPoint)
-            bitmap.translateBy(x: 7, y: 9)
-            bitmap.draw(svg, in: CGRect(origin: .zero, size: svg.size))
-            let bytes = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
-
-            var mismatches = 0
-            for y in 0..<height {
-                for x in 0..<width {
-                    let expected = Pixel(bytes + y * bitmap.bytesPerRow + x * 4)
-                    let color = try XCTUnwrap(rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB))
-                    let actual = Pixel(red: color.redComponent, green: color.greenComponent, blue: color.blueComponent, alpha: color.alphaComponent)
-                    if expected != actual { mismatches += 1 }
-                }
+            bitmap.translateBy(x: 0, y: 300)
+            bitmap.scaleBy(x: 2, y: -2)
+            let previous = NSGraphicsContext.current
+            if current {
+                NSGraphicsContext.current = NSGraphicsContext(cgContext: bitmap, flipped: true)
             }
-            XCTAssertEqual(mismatches, 0, "scale \(scale)")
+            defer { NSGraphicsContext.current = previous }
+            let renderer = CGRenderer(context: bitmap)
+            renderer.perform(svg.commands)
+            let bytes = Array(UnsafeBufferPointer(start: try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self), count: 1_600 * 300))
+            return (bytes, renderer.filterLayers.spentPasses)
         }
+        let appKit = try render(current: true)
+        let plain = try render(current: false)
+        // two CGPatterns, the rotated rect's own and one the page and circle share: two commands and four
+        // tile pixels each, as in a plain bitmap
+        XCTAssertEqual(appKit.spent, 2 * (2 * CGRenderer.patternCommandCost + 16))
+        XCTAssertEqual(appKit.spent, plain.spent)
+        // the same pixels, but where translucent dot edges composite over others: rounded once more through
+        // the offscreen, at most a level apart (no seam, no misplaced tile)
+        let differing = zip(appKit.bytes, plain.bytes).filter { $0 != $1 }
+        XCTAssertLessThan(differing.count, appKit.bytes.count / 100)
+        XCTAssertTrue(differing.allSatisfy { abs(Int($0) - Int($1)) <= 1 })
+    }
+
+    /// Pixels where a flipped, layer-backed view drawing `svg` inset by (7, 9), as the app draws a page,
+    /// differs in colour from a plain bitmap drawing it placed alike.
+    @MainActor
+    func mismatchesOfAFlippedView(_ svg: SVG, scale: CGFloat) throws -> Int {
+        let view = PageView(svg: svg, inset: CGPoint(x: 7, y: 9), scale: scale)
+        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: rep)
+
+        // the same page in a plain bitmap, placed as the view places it
+        let width = rep.pixelsWide
+        let height = rep.pixelsHigh
+        let pixelsPerPoint = CGFloat(width) / view.bounds.width
+        let bitmap = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        bitmap.translateBy(x: 0, y: CGFloat(height))
+        bitmap.scaleBy(x: pixelsPerPoint, y: -pixelsPerPoint)
+        bitmap.translateBy(x: 7, y: 9)
+        bitmap.draw(svg, in: CGRect(origin: .zero, size: svg.size))
+        let bytes = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
+
+        var mismatches = 0
+        for y in 0..<height {
+            for x in 0..<width {
+                let expected = Pixel(bytes + y * bitmap.bytesPerRow + x * 4)
+                let color = try XCTUnwrap(rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB))
+                let actual = Pixel(red: color.redComponent, green: color.greenComponent, blue: color.blueComponent, alpha: color.alphaComponent)
+                if expected != actual { mismatches += 1 }
+            }
+        }
+        return mismatches
     }
 }
 

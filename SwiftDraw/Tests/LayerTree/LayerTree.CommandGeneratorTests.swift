@@ -39,9 +39,10 @@ final class LayerTreeCommandGeneratorTests: XCTestCase {
         let generator = LayerTree.CommandGenerator(provider: LayerTreeProvider(), size: .zero, options: .default)
         let commands = generator.renderCommands(for: layer, colorConverter: .default)
 
+        // the two <use> copies are marked
         XCTAssertEqual(
             commands.count,
-            165
+            169
         )
     }
 

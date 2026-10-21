@@ -44,6 +44,8 @@ extension LayerTree {
         var maskIsClip = false
         var filters: [FilterPrimitive] = []
         var filterRegion = FilterRegion()
+        /// Drawn by a `<use>`: renderers may bound what copies draw, which references multiply.
+        var isCopy = false
 
         enum Contents: Hashable {
             case shape(Shape, StrokeAttributes, FillAttributes)
@@ -74,7 +76,8 @@ extension LayerTree {
                   transform == [],
                   clip == [],
                   mask == nil,
-                  filters == [] else { return nil }
+                  filters == [],
+                  !isCopy else { return nil }
 
             return first
         }
@@ -89,6 +92,7 @@ extension LayerTree {
             maskIsClip.hash(into: &hasher)
             filters.hash(into: &hasher)
             filterRegion.hash(into: &hasher)
+            isCopy.hash(into: &hasher)
         }
 
         static func ==(lhs: Layer, rhs: Layer) -> Bool {
@@ -102,7 +106,8 @@ extension LayerTree {
             lhs.mask == rhs.mask &&
             lhs.maskIsClip == rhs.maskIsClip &&
             lhs.filters == rhs.filters &&
-            lhs.filterRegion == rhs.filterRegion
+            lhs.filterRegion == rhs.filterRegion &&
+            lhs.isCopy == rhs.isCopy
         }
     }
 
