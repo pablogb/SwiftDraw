@@ -63,6 +63,20 @@ final class LayerTreePathTests: XCTestCase {
         XCTAssertEqual(path.location, Point(110, 90))
     }
 
+    func testSegmentAfterACloseContinuesFromTheSubpathStart() throws {
+        let path = try LayerTree.Builder.createPath(from: XMLParser().parsePath(from: "M10 10 L20 20 Z Z l5 0"))
+        XCTAssertEqual(path.segments.last, line(15, 10))
+    }
+
+    func testRunOfClosesBuildsInLinearTime() throws {
+        let element = try XMLParser().parsePath(from: "M1 1 L5 5" + String(repeating: "Z", count: 200_000))
+        let start = Date()
+        let path = try LayerTree.Builder.createPath(from: element)
+        XCTAssertEqual(path.segments.count, 200_002)
+        // quadratic, it took about 8 s
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2)
+    }
+
     func testMove() {
         var m = LayerTree.Builder.createMove(from: .move(x: 10, y: 10, space: .absolute), last: .zero)
         XCTAssertEqual(m, move(10, 10))

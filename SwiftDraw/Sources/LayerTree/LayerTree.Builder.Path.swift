@@ -41,11 +41,17 @@ extension LayerTree.Builder {
 
     static func createPath(from element: DOM.Path) throws -> LayerTree.Path {
         let path = Path()
+        // the subpath's start, kept here: after a close `path.location` searches back for it,
+        // which a run of closes makes quadratic
+        var start: Point?
 
         for s in element.segments {
             let segments = try makeSegments(from: s,
-                                            last: path.location ?? Point.zero,
+                                            last: path.segments.last?.location ?? start ?? Point.zero,
                                             previous: path.lastControl)
+            for segment in segments where segment.isMove {
+                start = segment.location
+            }
             path.segments.append(contentsOf: segments)
         }
 
