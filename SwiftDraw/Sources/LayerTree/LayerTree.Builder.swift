@@ -1037,6 +1037,15 @@ private extension DOM.Fill {
             return c
         }
     }
+
+    var url: URL? {
+        switch self {
+        case .url(let url), .urlWithFallback(let url, _):
+            return url
+        case .color:
+            return nil
+        }
+    }
 }
 
 private extension DOM.SVG {
@@ -1126,16 +1135,29 @@ extension LayerTree.Builder {
             return cost <= maxElements - elements
         }
 
-        /// The size of what the document draws itself, at what a copy of it costs (`cost(of:)`): its own
-        /// elements, not those in defs, clip paths, masks or patterns, nor any `display="none"` hides. Content
-        /// that is never drawn does not raise the budget.
+        /// The size of what the document draws at least once, at what a copy of it costs (`cost(of:)`): its own
+        /// elements, and the contents of each `<use>` target, clip path, mask and pattern they reference, once.
+        /// Content never drawn — defs nothing references, anything `display="none"` hides — does not raise the
+        /// budget.
         static func size(of svg: DOM.SVG) -> Int {
             var pending = svg.childElements
+            var referenced = Set<String>()
             var total = 0
             while let element = pending.popLast() {
-                guard DOM.presentationAttributes(for: element, styles: svg.styles).display != DOM.DisplayMode.none
-                else { continue }
+                let attributes = DOM.presentationAttributes(for: element, styles: svg.styles)
+                guard attributes.display != DOM.DisplayMode.none else { continue }
                 total += cost(of: element)
+                var ids = [attributes.clipPath?.fragmentID, attributes.mask?.fragmentID,
+                           attributes.fill?.url?.fragmentID, attributes.stroke?.url?.fragmentID]
+                if let use = element as? DOM.Use {
+                    ids.append(use.href.fragmentID)
+                }
+                for case let id? in ids where referenced.insert(id).inserted {
+                    pending += svg.defs.clipPaths.first { $0.id == id }?.childElements
+                        ?? svg.defs.masks.first { $0.id == id }?.childElements
+                        ?? svg.defs.patterns.first { $0.id == id }?.childElements
+                        ?? svg.firstGraphicsElement(with: id).map { [$0] } ?? []
+                }
                 if let container = element as? any ContainerElement {
                     pending.append(contentsOf: container.childElements)
                 }

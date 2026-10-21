@@ -189,9 +189,9 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
         body += ##"</defs><use xlink:href="#l3"/>"##
         let builder = LayerTree.Builder(svg: try makeSVG(body))
         let s = Self.stats(of: builder.makeLayer())
-        // the floor, and 32 times what the document draws itself: one <use>
+        // the floor, and 32 times what the document draws at least once: 1035 elements
         let budget = builder.references.maxElements
-        XCTAssertEqual(budget, LayerTree.Builder.ReferenceGuard.minElements + 32 * 1)
+        XCTAssertEqual(budget, LayerTree.Builder.ReferenceGuard.minElements + 32 * 1_035)
         XCTAssertEqual(builder.references.elements, budget)
         // every element counted built at most one shape; then copying stopped
         XCTAssertLessThanOrEqual(s.shapes, budget)
@@ -199,12 +199,14 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
     }
 
     func testContentNeverDrawnDoesNotRaiseTheBudget() throws {
-        // a long text in defs and a long path display="none" hides: only the 10 rects and the <use> count
+        // a long text in defs nothing references and a long path display="none" hides: only the 10 rects count
         let text = ##"<defs><text id="t">"## + String(repeating: "W", count: 100_000) + "</text></defs>"
         let hidden = ##"<g display="none"><path d="M0 0"## + String(repeating: " L1 1", count: 80_000) + ##""/></g>"##
         let rects = String(repeating: ##"<rect width="1" height="1"/>"##, count: 10)
-        let svg = try makeSVG(text + hidden + rects + ##"<use xlink:href="#t"/>"##)
-        XCTAssertEqual(LayerTree.Builder.ReferenceGuard.size(of: svg), 11)
+        XCTAssertEqual(LayerTree.Builder.ReferenceGuard.size(of: try makeSVG(text + hidden + rects)), 10)
+        // drawn once through two <use>s, the text counts once, as a copy of it costs
+        let used = try makeSVG(text + hidden + rects + ##"<use xlink:href="#t"/><use xlink:href="#t"/>"##)
+        XCTAssertEqual(LayerTree.Builder.ReferenceGuard.size(of: used), 10 + 2 + 1 + 100_000 * 10)
     }
 
     func testTheDocumentsSizeAddsAtMostItsCeiling() {
