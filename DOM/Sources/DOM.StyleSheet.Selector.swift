@@ -434,13 +434,16 @@ package extension DOM.StyleSheet {
         private var classTokens = [ObjectIdentifier: Set<String>]()
         private var memo = [MemoKey: Bool]()
 
-        // compound selector tests, memo hits and ancestor / sibling walk steps, for performance tests
+        // compound selector tests, memo hits, ancestor / sibling walk steps and merged rules, for
+        // performance tests; simple selectors past the first and long attribute values count extra
         package private(set) var evaluations = 0
 
         // about 1 s of matching (0.4–0.7 µs each); past it no further rule is tried, which also
         // bounds the memo (one entry per evaluation at most). A 10,000-cell grid styled by a dozen
-        // rules, descendant and sibling ones included, uses a quarter of it.
+        // rules, descendant and sibling ones included, uses under a third of it (21 per element).
+        // Larger documents get `evaluationsPerElement` each, so matching stays linear in their size.
         package var evaluationBudget = 2_000_000
+        package static let evaluationsPerElement = 64
 
         private struct MemoKey: Hashable {
             var rule: Int
@@ -484,6 +487,7 @@ package extension DOM.StyleSheet {
                     stack.append(child)
                 }
             }
+            evaluationBudget = max(evaluationBudget, Self.evaluationsPerElement * (parents.count + 1))
         }
 
         package var isEmpty: Bool { selectors.isEmpty }
@@ -500,12 +504,16 @@ package extension DOM.StyleSheet {
                 candidates += byClass[name] ?? []
             }
 
-            let matching = Set(candidates)
+            // each rule sits in one bucket and class tokens are a set: no rule is listed twice.
+            // Source order, so an element met when the budget runs out keeps its first rules.
+            let matching = candidates.sorted()
                 .filter { evaluations < evaluationBudget && matches(rule: $0, at: selectors[$0].compounds.count - 1, element) }
                 .sorted { l, r in
                     specificities[l] == specificities[r] ? l < r : specificities[l] < specificities[r]
                 }
 
+            // merging a rule's declarations costs about as much as testing it
+            evaluations += matching.count
             var result = Matched()
             for index in matching {
                 result.attributes = result.attributes.applyingAttributes(attributes[index])
@@ -590,6 +598,8 @@ package extension DOM.StyleSheet {
 
         private func matches(_ c: ComplexSelector.Compound, _ e: XML.Element) -> Bool {
             if let name = c.element, name != e.name { return false }
+            // the evaluation pays for one simple selector; `.a.a.a…` pays for each of the others
+            evaluations += max(0, c.ids.count + c.classes.count + c.attributes.count + c.pseudoClasses.count - 1)
             if !c.ids.isEmpty {
                 guard let id = e.attributes["id"], c.ids.allSatisfy({ $0 == id }) else { return false }
             }
@@ -597,7 +607,7 @@ package extension DOM.StyleSheet {
                 let tokens = classes(of: e)
                 guard c.classes.allSatisfy(tokens.contains) else { return false }
             }
-            for a in c.attributes where !matches(a, e) { return false }
+            for a in c.attributes where evaluations >= evaluationBudget || !matches(a, e) { return false }
             for p in c.pseudoClasses where !matches(p, e) { return false }
             return true
         }
@@ -605,6 +615,11 @@ package extension DOM.StyleSheet {
         private func matches(_ a: ComplexSelector.AttributeMatch, _ e: XML.Element) -> Bool {
             guard var actual = e.attributes[a.name] else { return false }
             guard let op = a.match else { return true }
+            // these read the whole value (a 300 KB `d` against 400 `[d*=…]` rules took 5 s): about
+            // 40 ns a byte, and 100 for `~=`, which splits it. An evaluation is 0.3–0.7 µs.
+            if a.caseInsensitive || op == .includes || op == .substring {
+                evaluations += actual.utf8.count / (op == .includes ? 4 : 8)
+            }
             var expected = a.value
             if a.caseInsensitive {
                 actual = actual.lowercased()

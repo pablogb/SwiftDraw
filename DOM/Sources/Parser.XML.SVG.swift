@@ -110,16 +110,18 @@ package extension XMLParser {
         }
         defer { lengthContext.viewports.removeLast() }
 
-        svg.childElements = try parseGraphicsElements(e.children)
-        svg.viewBox = viewBox
-        svg.preserveAspectRatio = parsePreserveAspectRatio(try? att.parseString("preserveAspectRatio"))
-
+        // the root and the defs are matched before the body: should a huge body spend the
+        // matching budget, the styles every element inherits or references are kept
         svg.defs = isRoot ? try parseSVGDefs(e) : DOM.SVG.Defs()
         svg.styles = styles
 
         // attributes and style="" stay separate so stylesheet rules fall between them
         svg.attributes = try parsePresentationAttributes(e)
         applyStyle(of: e, to: svg)
+
+        svg.childElements = try parseGraphicsElements(e.children)
+        svg.viewBox = viewBox
+        svg.preserveAspectRatio = parsePreserveAspectRatio(try? att.parseString("preserveAspectRatio"))
 
         return svg
     }

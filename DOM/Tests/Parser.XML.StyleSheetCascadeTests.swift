@@ -37,6 +37,7 @@ import Foundation
 struct ParserXMLStyleSheetCascadeTests {
 
     typealias Selector = DOM.StyleSheet.ComplexSelector
+    typealias Matcher = DOM.StyleSheet.Matcher
 
     // MARK: - Selector parsing
 
@@ -518,8 +519,8 @@ struct ParserXMLStyleSheetCascadeTests {
         let (m, root) = try matcher(style: rules, body: body)
         let elements = allElements(root)
         for e in elements { _ = m.match(e) }
-        // one candidate rule per rect; scanning every rule would be 300 × 5,000
-        #expect(m.evaluations <= elements.count)
+        // one candidate rule per rect, tested then merged; scanning every rule would be 300 × 5,000
+        #expect(m.evaluations <= 2 * elements.count)
     }
 
     @Test
@@ -588,15 +589,17 @@ struct ParserXMLStyleSheetCascadeTests {
 
     @Test
     func matchingStopsAtTheEvaluationBudget() throws {
-        let rules = String(repeating: "* { fill: red } ", count: 100)
+        let rules = (0..<100).map { "* { stroke-width: \($0) } " }.joined()
         let body = String(repeating: "<g/>", count: 1_000)
         let (m, root) = try matcher(style: rules, body: body)
-        m.evaluationBudget = 10_000
+        m.evaluationBudget = 10_050
         let results = root.children.map { m.match($0) }
-        // 100 candidates each: the first 99 <g> (after the root) are matched, the rest are not
-        #expect(results[0..<99].allSatisfy { $0?.attributes.fill == .color(.keyword(.red)) })
-        #expect(results[100...].allSatisfy { $0 == nil })
-        #expect(m.evaluations <= m.evaluationBudget)
+        // 100 rules tested and merged per <g>: 50 <g> are fully matched
+        #expect(results[0..<50].allSatisfy { $0?.attributes.strokeWidth == 99 })
+        // the next one gets the first 50 rules in source order, the same on every run
+        #expect(results[50]?.attributes.strokeWidth == 49)
+        #expect(results[51...].allSatisfy { $0 == nil })
+        #expect(m.evaluations <= m.evaluationBudget + 50)
     }
 
     @Test
@@ -622,8 +625,70 @@ struct ParserXMLStyleSheetCascadeTests {
         let cell = #"<g class="cell"><rect class="bg"/><text class="n">1</text></g>"#
         let row = #"<g class="row">"# + String(repeating: cell, count: 100) + "</g>"
         let (m, root) = try matcher(style: rules, body: #"<g id="board">"# + String(repeating: row, count: 100) + "</g>")
-        for e in allElements(root) { _ = m.match(e) }
-        // 10,000 cells, 30,000 elements: about 490,000 evaluations
+        let elements = allElements(root)
+        for e in elements { _ = m.match(e) }
+        // 10,000 cells, 30,000 elements: about 620,000 evaluations, 21 per element
         #expect(m.evaluations < m.evaluationBudget / 3)
+        #expect(m.evaluations < Matcher.evaluationsPerElement * elements.count / 3)
+    }
+
+    @Test
+    func budgetGrowsWithTheDocument() throws {
+        let (small, _) = try matcher(style: "g { fill: red }", body: String(repeating: "<g/>", count: 1_000))
+        #expect(small.evaluationBudget == 2_000_000)
+        let (large, root) = try matcher(style: "g { fill: red }", body: String(repeating: "<g/>", count: 100_000))
+        #expect(large.evaluationBudget == Matcher.evaluationsPerElement * allElements(root).count)
+    }
+
+    @Test
+    func wideCompoundIsChargedPerSimpleSelector() throws {
+        let compound = String(repeating: ".a", count: 1_000)
+        let body = String(repeating: #"<g class="a"/>"#, count: 1_000)
+        let (m, root) = try matcher(style: "\(compound) { fill: red }", body: body)
+        m.evaluationBudget = 100_000
+        let results = root.children.map { m.match($0) }
+        // about 1,000 per <g>: counted as one each, every <g> was matched, 1,000 class tests each
+        #expect(results[0..<90].allSatisfy { $0?.attributes.fill == .color(.keyword(.red)) })
+        #expect(results[110...].allSatisfy { $0 == nil })
+    }
+
+    @Test
+    func longAttributeValuesAreChargedPerByte() throws {
+        let d = String(repeating: "L1 1 ", count: 3_200)
+        for test in [#"d*="L1""#, #"d~="L1""#, #"d^="L1" i"#] {
+            let rules = (0..<100).map { "[\(test)] { stroke-width: \($0) }" }.joined(separator: " ")
+            let (m, root) = try matcher(style: rules, body: #"<path d="\#(d)"/>"#)
+            m.evaluationBudget = 10_000
+            let path = try #require(root.children.first)
+            // 16 KB read (or lowercased) per rule: only the first rules are tried before the budget is spent
+            #expect(try #require(m.match(path)).attributes.strokeWidth.map { $0 < 20 } == true)
+        }
+    }
+
+    @Test
+    func compoundOfAttributeTestsStopsAtTheBudget() throws {
+        let d = String(repeating: "L1 1 ", count: 3_200)
+        let compound = String(repeating: #"[d*="L1"]"#, count: 1_000)
+        let (m, root) = try matcher(style: "\(compound) { fill: red }", body: #"<path d="\#(d)"/>"#)
+        m.evaluationBudget = 10_000
+        #expect(m.match(try #require(root.children.first))?.attributes.fill == nil)
+        // the compound is charged up front (1,000), then stops in the middle of its 16 KB scans
+        #expect(m.evaluations < 2 * m.evaluationBudget)
+    }
+
+    @Test
+    func rootAndDefsAreStyledBeforeTheBody() throws {
+        // 100,000 classes in one compound: 20 tests spend the 2 M budget
+        let wide = String(repeating: ".a", count: 100_000)
+        let svg = try DOM.SVG.parse(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" class="r">
+        <style>\(wide) { fill: red } .r { fill: blue } .s { stop-color: #00ff00 }</style>
+        \(String(repeating: #"<g class="a"/>"#, count: 40))
+        <defs><linearGradient id="lg"><stop offset="0" class="s"/></linearGradient></defs>
+        </svg>
+        """)
+        #expect(svg.childElements.last?.matchedStyle == nil)
+        #expect(svg.matchedStyle?.attributes.fill == .color(.keyword(.blue)))
+        #expect(try #require(svg.defs.linearGradients.first).stops.first?.color == .hex(0, 255, 0))
     }
 }

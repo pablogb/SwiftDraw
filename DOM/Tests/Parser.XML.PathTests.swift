@@ -239,6 +239,19 @@ struct ParserXMLPathTests {
         let path = try #require(svg.childElements.first as? DOM.Path)
         #expect(path.segments == [move(0, 0, .absolute), .close])
     }
+
+    @Test
+    func runOfClosesIsLinear() throws {
+        // each command read the whole run of command letters after it: 40,000 `Z` took minutes
+        nonisolated(unsafe) var segments: [Segment]?
+        let done = DispatchSemaphore(value: 0)
+        Thread {
+            segments = try? XMLParser().parsePathSegments("M0 0" + String(repeating: "Z", count: 100_000))
+            done.signal()
+        }.start()
+        #expect(done.wait(timeout: .now() + 30) == .success)
+        #expect(segments?.count == 100_001)
+    }
 }
 
 private func parseSegment(_ text: String) -> Segment? {

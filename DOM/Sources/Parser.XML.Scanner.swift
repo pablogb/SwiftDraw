@@ -402,15 +402,14 @@ package extension Scanner {
         return match.boolValue
     }
     
+    // reads one character: scanning the whole run of `set` would make a run of `Z` quadratic
     func scan(first set: Foundation.CharacterSet) -> UnicodeScalar? {
         let start = currentIndex
-        guard let scalar = scanCharacters(from: set)?.unicodeScalars.first else {
+        guard let scalar = scanCharacter()?.unicodeScalars.first,
+              set.contains(scalar) else {
             currentIndex = start
             return nil
         }
-
-        currentIndex = start
-        _ = scanCharacter()
         return scalar
     }
 
