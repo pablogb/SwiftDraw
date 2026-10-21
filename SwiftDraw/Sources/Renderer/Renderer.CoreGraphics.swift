@@ -322,13 +322,19 @@ struct CGProvider: RendererTypeProvider {
 }
 
 extension CGImageSource {
-    // the first image's, read from its header
+    // the first image's, read from its header, as it is shown: EXIF orientations 5–8 turn it a quarter
     var pixelSize: (width: Int, height: Int)? {
         guard let properties = CGImageSourceCopyPropertiesAtIndex(self, 0, nil) as? [CFString: Any],
               let width = properties[kCGImagePropertyPixelWidth] as? Int,
               let height = properties[kCGImagePropertyPixelHeight] as? Int,
               width > 0, height > 0 else { return nil }
-        return (width, height)
+        return orientation >= 5 ? (height, width) : (width, height)
+    }
+
+    // EXIF orientation, 1 (upright) to 8
+    var orientation: Int {
+        let properties = CGImageSourceCopyPropertiesAtIndex(self, 0, nil) as? [CFString: Any]
+        return properties?[kCGImagePropertyOrientation] as? Int ?? 1
     }
 }
 
@@ -662,11 +668,20 @@ struct CGRenderer: Renderer {
         let side = max(device.width, device.height) * scale
         let needed = Double(device.width * device.height * scale * scale)
         guard side.isFinite else { return nil }
+        // only the thumbnail path applies an EXIF orientation, as a browser shows the image
+        let isTurned = source.orientation != 1
         guard Double(width) * Double(height) > max(Double(CGRenderer.minDecodedPixels), 4 * needed) else {
-            return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: true] as CFDictionary)
+            guard isTurned else {
+                return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: true] as CFDictionary)
+            }
+            return CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                                   kCGImageSourceCreateThumbnailWithTransform: true,
+                                                                   kCGImageSourceThumbnailMaxPixelSize: max(width, height),
+                                                                   kCGImageSourceShouldCache: true] as CFDictionary)
         }
         let maxSide = 1 << Int(log2(max(1, Double(side))).rounded(.up))
         return CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                               kCGImageSourceCreateThumbnailWithTransform: true,
                                                                kCGImageSourceThumbnailMaxPixelSize: maxSide,
                                                                kCGImageSourceShouldCache: true,
                                                                kCGImageSourceShouldCacheImmediately: true] as CFDictionary)

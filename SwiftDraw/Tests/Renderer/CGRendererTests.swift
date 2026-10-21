@@ -266,6 +266,45 @@ final class CGRendererTests: XCTestCase {
     XCTAssertEqual(renderer.filterLayers.lineWidth, 2)
   }
 
+  func testImageIsShownAsItsEXIFOrientationSays() throws {
+    // 40 × 20, red left and blue right, tagged 6 (turned a quarter clockwise): shown 20 × 40, red on top,
+    // as a 20 × 40 image red on top and untagged is
+    func jpeg(width: Int, height: Int, red: CGRect, orientation: Int) throws -> String {
+      let image = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+      image.setFillColor(red: 0, green: 0, blue: 1, alpha: 1)
+      image.fill(CGRect(x: 0, y: 0, width: width, height: height))
+      image.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+      image.fill(red)
+      let data = NSMutableData()
+      let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil))
+      CGImageDestinationAddImage(destination, try XCTUnwrap(image.makeImage()),
+                                 [kCGImagePropertyOrientation: orientation, kCGImageDestinationLossyCompressionQuality: 1] as CFDictionary)
+      XCTAssertTrue(CGImageDestinationFinalize(destination))
+      return (data as Data).base64EncodedString()
+    }
+    let turned = try jpeg(width: 40, height: 20, red: CGRect(x: 0, y: 0, width: 20, height: 20), orientation: 6)
+    let upright = try jpeg(width: 20, height: 40, red: CGRect(x: 0, y: 20, width: 20, height: 20), orientation: 1)
+    let source = try XCTUnwrap(CGProvider().createImage(from: LayerTree.Image(bitmap: .jpeg(try XCTUnwrap(Data(base64Encoded: turned))))))
+    XCTAssertEqual(CGProvider().createSize(from: source), LayerTree.Size(20, 40))
+
+    func draw(_ base64: String) throws -> [UInt8] {
+      let svg = try XCTUnwrap(SVG(xml: """
+      <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="40">
+      <image width="20" height="40" xlink:href="data:image/jpeg;base64,\(base64)"/>
+      </svg>
+      """))
+      let canvas = try XCTUnwrap(CGContext(data: nil, width: 20, height: 40, bitsPerComponent: 8, bytesPerRow: 0,
+                                           space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+      canvas.draw(svg)
+      let pixels = try XCTUnwrap(canvas.data).assumingMemoryBound(to: UInt8.self)
+      return [(10, 5), (10, 35)].map { x, y in pixels[y * canvas.bytesPerRow + x * 4] }
+    }
+    let reds = try draw(turned)
+    XCTAssertEqual(reds, try draw(upright))
+    XCTAssertNotEqual(reds[0] > 128, reds[1] > 128)
+  }
+
   func testLargeImageIsDecodedAtTheSizeItIsDrawn() throws {
     // 4000 × 2000 grey pixels drawn 100 × 50 points: 128 pixels wide in a bitmap, at least 300 ppi in a PDF
     let image = try XCTUnwrap(CGContext(data: nil, width: 4_000, height: 2_000, bitsPerComponent: 8, bytesPerRow: 0,
