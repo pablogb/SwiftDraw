@@ -1078,6 +1078,8 @@ extension LayerTree.Builder {
         static let referenceDepth = 12
         static let minElements = 250_000
         static let documentMultiple = 32
+        /// what the document's size may add: about 0.7 KB and 6 µs an element
+        static let maxDocumentElements = 1_000_000
         private var active = Set<String>()
         /// the depth of the elements built next
         var level = 0
@@ -1119,22 +1121,21 @@ extension LayerTree.Builder {
         private func canAfford(_ cost: Int) -> Bool {
             if cost > maxElements - elements, let documentSize {
                 self.documentSize = nil
-                maxElements += Self.documentMultiple * min(documentSize(), Int.max / 2 / Self.documentMultiple)
+                maxElements += min(Self.maxDocumentElements, Self.documentMultiple * min(documentSize(), Int.max / 2 / Self.documentMultiple))
             }
             return cost <= maxElements - elements
         }
 
-        /// The size of the document's own elements, those it draws and those its defs, clip paths, masks and
-        /// patterns hold, in elements: one each, and an eighth per path segment, point or character, about a
-        /// coordinate in the file. A character costs more to copy than its size (`cost(of:)`).
+        /// The size of what the document draws itself, at what a copy of it costs (`cost(of:)`): its own
+        /// elements, not those in defs, clip paths, masks or patterns, nor any `display="none"` hides. Content
+        /// that is never drawn does not raise the budget.
         static func size(of svg: DOM.SVG) -> Int {
-            var pending = svg.childElements + Array(svg.defs.elements.values)
-            pending += svg.defs.clipPaths.flatMap(\.childElements)
-            pending += svg.defs.masks.flatMap(\.childElements)
-            pending += svg.defs.patterns.flatMap(\.childElements)
+            var pending = svg.childElements
             var total = 0
             while let element = pending.popLast() {
-                total += (element as? DOM.Text).map { 1 + $0.value.utf16.count / 8 } ?? cost(of: element)
+                guard DOM.presentationAttributes(for: element, styles: svg.styles).display != DOM.DisplayMode.none
+                else { continue }
+                total += cost(of: element)
                 if let container = element as? any ContainerElement {
                     pending.append(contentsOf: container.childElements)
                 }

@@ -189,13 +189,30 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
         body += ##"</defs><use xlink:href="#l3"/>"##
         let builder = LayerTree.Builder(svg: try makeSVG(body))
         let s = Self.stats(of: builder.makeLayer())
-        // the floor, and 32 times the document's own size: 1035 elements
+        // the floor, and 32 times what the document draws itself: one <use>
         let budget = builder.references.maxElements
-        XCTAssertEqual(budget, LayerTree.Builder.ReferenceGuard.minElements + 32 * 1_035)
+        XCTAssertEqual(budget, LayerTree.Builder.ReferenceGuard.minElements + 32 * 1)
         XCTAssertEqual(builder.references.elements, budget)
         // every element counted built at most one shape; then copying stopped
         XCTAssertLessThanOrEqual(s.shapes, budget)
         XCTAssertGreaterThan(s.shapes, budget * 9 / 10)
+    }
+
+    func testContentNeverDrawnDoesNotRaiseTheBudget() throws {
+        // a long text in defs and a long path display="none" hides: only the 10 rects and the <use> count
+        let text = ##"<defs><text id="t">"## + String(repeating: "W", count: 100_000) + "</text></defs>"
+        let hidden = ##"<g display="none"><path d="M0 0"## + String(repeating: " L1 1", count: 80_000) + ##""/></g>"##
+        let rects = String(repeating: ##"<rect width="1" height="1"/>"##, count: 10)
+        let svg = try makeSVG(text + hidden + rects + ##"<use xlink:href="#t"/>"##)
+        XCTAssertEqual(LayerTree.Builder.ReferenceGuard.size(of: svg), 11)
+    }
+
+    func testTheDocumentsSizeAddsAtMostItsCeiling() {
+        let references = LayerTree.Builder.ReferenceGuard(documentSize: { 100_000_000 })
+        XCTAssertTrue(references.spend(LayerTree.Builder.ReferenceGuard.minElements))
+        XCTAssertTrue(references.spend(1))
+        XCTAssertEqual(references.maxElements,
+                       LayerTree.Builder.ReferenceGuard.minElements + LayerTree.Builder.ReferenceGuard.maxDocumentElements)
     }
 
     func testHeavyCopiesSpendTheBudgetByTheirSize() throws {
