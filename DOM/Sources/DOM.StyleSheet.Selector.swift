@@ -162,8 +162,11 @@ package extension DOM.StyleSheet.ComplexSelector {
     // matching recurses once per compound: a longer selector is dropped so it cannot exhaust
     // the 512 KB stack of a background thread (no real stylesheet comes near 32)
     static let maxCompounds = 32
+    // a selector's own names and values are re-read by every evaluation; real ones are short
+    static let maxLength = 1024
 
     static func parse(_ text: String) -> Self? {
+        guard text.utf8.count <= maxLength else { return nil }
         var s = SelectorScanner(text)
         var compounds = [Compound]()
         var combinators = [Combinator]()
@@ -441,9 +444,12 @@ package extension DOM.StyleSheet {
         // about 1 s of matching (0.4–0.7 µs each); past it no further rule is tried, which also
         // bounds the memo (one entry per evaluation at most). A 10,000-cell grid styled by a dozen
         // rules, descendant and sibling ones included, uses under a third of it (21 per element).
-        // Larger documents get `evaluationsPerElement` each, so matching stays linear in their size.
+        // Larger documents get `evaluationsPerElement` each, up to `maxEvaluationBudget` (about
+        // 2 s, a 6 MB grid fully styled). The memo stops growing at `maxMemo` entries.
         package var evaluationBudget = 2_000_000
         package static let evaluationsPerElement = 64
+        package static let maxEvaluationBudget = 4_000_000
+        static let maxMemo = 1_000_000
 
         private struct MemoKey: Hashable {
             var rule: Int
@@ -487,7 +493,7 @@ package extension DOM.StyleSheet {
                     stack.append(child)
                 }
             }
-            evaluationBudget = max(evaluationBudget, Self.evaluationsPerElement * (parents.count + 1))
+            evaluationBudget = min(Self.maxEvaluationBudget, max(evaluationBudget, Self.evaluationsPerElement * (parents.count + 1)))
         }
 
         package var isEmpty: Bool { selectors.isEmpty }
@@ -547,7 +553,7 @@ package extension DOM.StyleSheet {
                 }
             }
 
-            if !isLast { memo[key] = result }
+            if !isLast, memo.count < Self.maxMemo { memo[key] = result }
             return result
         }
 
@@ -572,7 +578,7 @@ package extension DOM.StyleSheet {
                 }
                 current = candidate
             }
-            for id in walked {
+            for id in walked where memo.count < Self.maxMemo {
                 memo[MemoKey(rule: rule, compound: i, kind: kind, element: id)] = result
             }
             return result
@@ -616,9 +622,12 @@ package extension DOM.StyleSheet {
             guard var actual = e.attributes[a.name] else { return false }
             guard let op = a.match else { return true }
             // these read the whole value (a 300 KB `d` against 400 `[d*=…]` rules took 5 s): about
-            // 40 ns a byte, and 100 for `~=`, which splits it. An evaluation is 0.3–0.7 µs.
+            // 40 ns a byte, and 100 for `~=`, which splits it. An evaluation is 0.3–0.7 µs. `*=`
+            // searches naively, so a byte can cost a comparison of the whole pattern.
             if a.caseInsensitive || op == .includes || op == .substring {
-                evaluations += actual.utf8.count / (op == .includes ? 4 : 8)
+                let length = actual.utf8.count
+                evaluations += op == .substring ? length * max(1, a.value.utf8.count) / 16
+                    : length / (op == .includes ? 4 : 8)
             }
             var expected = a.value
             if a.caseInsensitive {

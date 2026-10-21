@@ -636,20 +636,38 @@ struct ParserXMLStyleSheetCascadeTests {
     func budgetGrowsWithTheDocument() throws {
         let (small, _) = try matcher(style: "g { fill: red }", body: String(repeating: "<g/>", count: 1_000))
         #expect(small.evaluationBudget == 2_000_000)
-        let (large, root) = try matcher(style: "g { fill: red }", body: String(repeating: "<g/>", count: 100_000))
+        let (large, root) = try matcher(style: "g { fill: red }", body: String(repeating: "<g/>", count: 50_000))
         #expect(large.evaluationBudget == Matcher.evaluationsPerElement * allElements(root).count)
+        let (huge, _) = try matcher(style: "g { fill: red }", body: String(repeating: "<g/>", count: 100_000))
+        #expect(huge.evaluationBudget == Matcher.maxEvaluationBudget)
+    }
+
+    @Test
+    func selectorLongerThanItsLimitIsDropped() throws {
+        #expect(Selector.parse(String(repeating: "a", count: Selector.maxLength)) != nil)
+        #expect(Selector.parse(String(repeating: "a", count: Selector.maxLength + 1)) == nil)
+    }
+
+    @Test
+    func substringTestIsChargedByItsPatternLength() throws {
+        let d = String(repeating: "L1 1 ", count: 3_200)
+        let pattern = String(repeating: "x", count: 200)
+        let (m, root) = try matcher(style: #"[d*="\#(pattern)"] { fill: red }"#, body: #"<path d="\#(d)"/>"#)
+        _ = m.match(try #require(root.children.first))
+        // a naive search: each of the 16 KB can start a comparison of the 200-byte pattern
+        #expect(m.evaluations >= d.utf8.count * 200 / 16)
     }
 
     @Test
     func wideCompoundIsChargedPerSimpleSelector() throws {
-        let compound = String(repeating: ".a", count: 1_000)
+        let compound = String(repeating: ".a", count: 500)
         let body = String(repeating: #"<g class="a"/>"#, count: 1_000)
         let (m, root) = try matcher(style: "\(compound) { fill: red }", body: body)
         m.evaluationBudget = 100_000
         let results = root.children.map { m.match($0) }
-        // about 1,000 per <g>: counted as one each, every <g> was matched, 1,000 class tests each
-        #expect(results[0..<90].allSatisfy { $0?.attributes.fill == .color(.keyword(.red)) })
-        #expect(results[110...].allSatisfy { $0 == nil })
+        // about 500 per <g>: counted as one each, every <g> was matched, 500 class tests each
+        #expect(results[0..<180].allSatisfy { $0?.attributes.fill == .color(.keyword(.red)) })
+        #expect(results[220...].allSatisfy { $0 == nil })
     }
 
     @Test
@@ -668,22 +686,23 @@ struct ParserXMLStyleSheetCascadeTests {
     @Test
     func compoundOfAttributeTestsStopsAtTheBudget() throws {
         let d = String(repeating: "L1 1 ", count: 3_200)
-        let compound = String(repeating: #"[d*="L1"]"#, count: 1_000)
+        let compound = String(repeating: #"[d*="L1"]"#, count: 100)
         let (m, root) = try matcher(style: "\(compound) { fill: red }", body: #"<path d="\#(d)"/>"#)
         m.evaluationBudget = 10_000
         #expect(m.match(try #require(root.children.first))?.attributes.fill == nil)
-        // the compound is charged up front (1,000), then stops in the middle of its 16 KB scans
+        // the compound is charged up front (100), then stops in the middle of its 16 KB scans
         #expect(m.evaluations < 2 * m.evaluationBudget)
     }
 
     @Test
     func rootAndDefsAreStyledBeforeTheBody() throws {
-        // 100,000 classes in one compound: 20 tests spend the 2 M budget
-        let wide = String(repeating: ".a", count: 100_000)
+        // a 500-byte substring searched in 10 KB values: 7 tests spend the 2 M budget
+        let pattern = String(repeating: "b", count: 500)
+        let value = String(repeating: "a", count: 10_000)
         let svg = try DOM.SVG.parse(xml: """
         <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" class="r">
-        <style>\(wide) { fill: red } .r { fill: blue } .s { stop-color: #00ff00 }</style>
-        \(String(repeating: #"<g class="a"/>"#, count: 40))
+        <style>[data-x*="\(pattern)"] { fill: red } .r { fill: blue } .s { stop-color: #00ff00 }</style>
+        \(String(repeating: #"<g data-x="\#(value)"/>"#, count: 40))
         <defs><linearGradient id="lg"><stop offset="0" class="s"/></linearGradient></defs>
         </svg>
         """)
