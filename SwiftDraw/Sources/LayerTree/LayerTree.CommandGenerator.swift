@@ -98,7 +98,9 @@ extension LayerTree {
                     commands.append(contentsOf: renderCommands(forClip: layer.clip, using: layer.clipRule))
 
                     if let mask = state.mask {
-                        commands.append(.pushMask(mask, bounds: makeCoverage(for: layer).map(provider.createRect)))
+                        // the layer's own filter is drawn first and spreads past its contents (a blur)
+                        let coverage = layer.filters.isEmpty ? makeCoverage(for: layer) : state.filterLayer?.region
+                        commands.append(.pushMask(mask, bounds: coverage.map(provider.createRect)))
                     }
 
                     // filter is applied before clipping, masking and opacity

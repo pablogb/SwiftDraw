@@ -275,6 +275,17 @@ final class CGClipMaskTests: XCTestCase {
         XCTAssertLessThan(renderer.filterLayers.spentPasses, 2 * 30 * 30)
     }
 
+    func testMaskedFilteredContentsKeepWhatTheFilterDrawsBeyondThem() throws {
+        // a masked layer's own filter is drawn first: an offset (or a blur's spread) lands outside its contents
+        let colors = try render(#"""
+            <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="16" height="16"><rect width="16" height="16" fill="white"/></mask>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="16" height="16"><feOffset dx="6"/></filter>
+            <rect x="2" y="2" width="4" height="12" fill="red" filter="url(#f)" mask="url(#m)" />
+            """#)
+        XCTAssertEqual(colors(10), .red)
+        XCTAssertEqual(colors(4), .white)
+    }
+
     func testMaskedStrokeIsKeptWhereTheFillIsNot() throws {
         // the transparency layer covers the contents with their stroke
         let colors = try render(#"""
