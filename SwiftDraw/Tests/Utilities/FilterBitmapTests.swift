@@ -281,6 +281,28 @@ final class FilterBitmapTests: XCTestCase {
         XCTAssertEqual(deviations.map(\.0), [1])
     }
 
+    // the pixels differing from the one before are worked out one by one; runs of equal ones once
+    func testEvaluationIsChargedThePixelsWorkedOutOneByOne() {
+        let blue: [UInt8] = [0, 0, 255, 255]
+        // three changes: red, blue, transparent
+        let source = FilterBitmap(width: 4, height: 1, pixels: red + blue + blue + clear)
+        let region = LayerTree.Rect(x: 0, y: 0, width: 4, height: 1)
+        let identity: [Float] = [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0]
+        let filter = LayerTree.FilterLayer(region: region, primitives: [
+            primitive(.merge, [.sourceGraphic, .sourceGraphic], region),
+            primitive(.colorMatrix(identity), [.primitive(0)], region)
+        ])
+        var spent = [Int]()
+        var environment = LayerTree.FilterLayer.Environment(transform: .identity, blur: { _, _, _ in })
+        environment.spend = { spent.append($0); return true }
+        _ = filter.evaluate(source: source, environment: environment)
+        // a merge pass over the pixels changing in either input, a map over those changing in its result
+        XCTAssertEqual(spent, [32 * 4, 56 * 3])
+
+        environment.spend = { _ in false }
+        XCTAssertEqual(filter.evaluate(source: source, environment: environment), source)
+    }
+
     // user space at 2x, flipped vertically: offsets and deviations follow into pixels
     func testEvaluateMapsUserSpaceToPixels() {
         let source = makeSquare(size: 8, from: 3, to: 3)

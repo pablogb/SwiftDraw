@@ -212,6 +212,53 @@ final class CGRendererFilterTests: XCTestCase {
         XCTAssertEqual(bitmap.alpha(x: 95, y: 95), 1)
     }
 
+    func testFilterWorkOnChangingPixelsIsCharged() throws {
+        // the source merged over itself 40 times: cheap over a solid fill's runs of equal pixels, a pass per
+        // pixel over a gradient, which is more than the drawing's budget: drawn unfiltered
+        func render(fill: String) throws -> Bitmap {
+            try self.render(#"""
+            <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+                <linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient>
+                <filter id="merge" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="100">
+                    <feMerge>\#(String(repeating: #"<feMergeNode in="SourceGraphic"/>"#, count: 40))</feMerge>
+                </filter>
+                <rect x="10" y="10" width="80" height="80" fill="\#(fill)" fill-opacity="0.5" filter="url(#merge)" />
+            </svg>
+            """#, maxFilterLayerPixels: 200 * 200)
+        }
+        XCTAssertEqual(try render(fill: "black").alpha(x: 50, y: 50), 1, accuracy: 0.01)
+        XCTAssertEqual(try render(fill: "url(#g)").alpha(x: 50, y: 50), 0.5, accuracy: 0.01)
+    }
+
+    func testDropShadowedPageKeepsEveryShadow() throws {
+        // 81 cards with Figma's drop shadow on an A4 page at 300 ppi; pixels and budget both a 16th, for speed
+        let cards = (0..<81).map { i in
+            #"<rect x="\#(i % 9 * 64 + 10)" y="\#(i / 9 * 90 + 10)" width="50" height="70" fill="white" filter="url(#shadow)" />"#
+        }.joined()
+        let bitmap = try render(#"""
+        <svg width="595" height="842" xmlns="http://www.w3.org/2000/svg">
+            <filter id="shadow" x="-0.2" y="-0.2" width="1.4" height="1.5" color-interpolation-filters="sRGB">
+                <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+                <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+                <feOffset dy="4"/>
+                <feGaussianBlur stdDeviation="2"/>
+                <feComposite in2="hardAlpha" operator="out"/>
+                <feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0"/>
+                <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow"/>
+                <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow" result="shape"/>
+            </filter>
+            \#(cards)
+        </svg>
+        """#, scale: 300 / 72 / 4, maxFilterLayerPixels: CGRenderer.defaultMaxFilterLayerPixels / 16)
+        let scale = 300.0 / 72 / 4
+        for i in 0..<81 {
+            // 3 pt below the card's bottom edge
+            let x = Int((Double(i % 9 * 64 + 35) * scale).rounded())
+            let y = Int((Double(i / 9 * 90 + 83) * scale).rounded())
+            XCTAssertGreaterThan(bitmap.alpha(x: x, y: y), 0.05, "card \(i)")
+        }
+    }
+
     func testFilterLayerOfOverflowingRectIsNotMade() {
         // finite, but its integral (maxX = 2e308) is not: no Int(NaN) trap
         XCTAssertNil(CGFilterLayer.make(deviceRect: CGRect(x: 1e308, y: 0, width: 1e308, height: 10),

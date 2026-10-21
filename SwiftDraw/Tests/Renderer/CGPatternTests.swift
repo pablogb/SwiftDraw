@@ -165,8 +165,163 @@ extension CGPatternTests {
 
 extension CGPatternTests {
 
+    // As the app draws a page: a flipped, layer-backed view translates by an inset, then draws the page.
+    final class PageView: NSView {
+        let svg: SVG
+        let inset: CGPoint
+
+        init(svg: SVG, inset: CGPoint, scale: CGFloat) {
+            self.svg = svg
+            self.inset = inset
+            super.init(frame: CGRect(x: 0, y: 0, width: (svg.size.width + 2 * inset.x) * scale,
+                                     height: (svg.size.height + 2 * inset.y) * scale))
+            wantsLayer = true
+            scaleUnitSquare(to: NSSize(width: scale, height: scale))
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override var isFlipped: Bool { true }
+
+        override func draw(_ dirtyRect: NSRect) {
+            guard let context = NSGraphicsContext.current?.cgContext else { return }
+            context.translateBy(x: inset.x, y: inset.y)
+            context.draw(svg, in: CGRect(origin: .zero, size: svg.size))
+        }
+    }
+
+    @MainActor
+    func testPatternInAFlippedViewMatchesABitmapAtEachScale() throws {
+        // tiles of 10 × 8 from (3, 5), red top left and blue bottom right of each: placement, scale and
+        // orientation all show
+        let svg = try XCTUnwrap(SVG(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40">
+            <defs><pattern id="p" x="3" y="5" width="10" height="8" patternUnits="userSpaceOnUse">
+                <rect width="5" height="3" fill="red" /><rect x="5" y="4" width="5" height="4" fill="blue" />
+            </pattern></defs>
+            <rect x="2" y="2" width="36" height="36" fill="url(#p)" />
+        </svg>
+        """))
+        for scale in [1, 2] as [CGFloat] {
+            let view = PageView(svg: svg, inset: CGPoint(x: 7, y: 9), scale: scale)
+            let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+            view.cacheDisplay(in: view.bounds, to: rep)
+
+            // the same page in a plain bitmap, placed as the view places it
+            let width = rep.pixelsWide
+            let height = rep.pixelsHigh
+            let pixelsPerPoint = CGFloat(width) / view.bounds.width
+            let bitmap = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                                 space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            bitmap.translateBy(x: 0, y: CGFloat(height))
+            bitmap.scaleBy(x: pixelsPerPoint, y: -pixelsPerPoint)
+            bitmap.translateBy(x: 7, y: 9)
+            bitmap.draw(svg, in: CGRect(origin: .zero, size: svg.size))
+            let bytes = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
+
+            var mismatches = 0
+            for y in 0..<height {
+                for x in 0..<width {
+                    let expected = Pixel(bytes + y * bitmap.bytesPerRow + x * 4)
+                    let color = try XCTUnwrap(rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB))
+                    let actual = Pixel(red: color.redComponent, green: color.greenComponent, blue: color.blueComponent, alpha: color.alphaComponent)
+                    if expected != actual { mismatches += 1 }
+                }
+            }
+            XCTAssertEqual(mismatches, 0, "scale \(scale)")
+        }
+    }
+}
+
+extension CGPatternTests {
+
+    func testPatternCellIsGeneratedOnceForEveryShapeItFills() throws {
+        // a bounding-box pattern: every shape has its own tile, all drawn from one set of commands
+        let rects = (0..<50).map { ##"<rect x="\##($0 * 3)" width="\##($0 + 1)" height="\##(2 * $0 + 1)" fill="url(#p)"/>"## }.joined()
+        let svg = try XCTUnwrap(SVG(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">
+            <defs><pattern id="p" width="0.5" height="0.5"><rect width="1" height="1" fill="red"/></pattern></defs>
+            \(rects)
+        </svg>
+        """))
+        let patterns = svg.commands.compactMap { command -> CGTransformingPattern? in
+            guard case .setFillPattern(let pattern) = command else { return nil }
+            return pattern
+        }
+        XCTAssertEqual(patterns.count, 50)
+        let storage = patterns.map { $0.contents.withUnsafeBufferPointer { $0.baseAddress } }
+        XCTAssertEqual(Set(storage).count, 1)
+    }
+
+    /// Twenty 10 × 10 squares in a row, each under its own transform, filled with a pattern red on its left half.
+    func renderSquaresUnderTransforms(maxFilterLayerPixels: Int, current: Bool) throws -> (Int) -> CGFloat {
+        let squares = (0..<20).map { ##"<rect width="10" height="10" fill="url(#p)" transform="translate(\##($0 * 10) 0)"/>"## }.joined()
+        let svg = try XCTUnwrap(SVG(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="200" height="10">
+            <defs><pattern id="p" width="10" height="10" patternUnits="userSpaceOnUse"><rect width="5" height="10" fill="red"/></pattern></defs>
+            \(squares)
+        </svg>
+        """))
+        let bitmap = try XCTUnwrap(CGContext(data: nil, width: 200, height: 10, bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        bitmap.translateBy(x: 0, y: 10)
+        bitmap.scaleBy(x: 1, y: -1)
+        let previous = NSGraphicsContext.current
+        if current {
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: bitmap, flipped: true)
+        }
+        CGRenderer(context: bitmap, maxFilterLayerPixels: maxFilterLayerPixels).perform(svg.commands)
+        NSGraphicsContext.current = previous
+        let bytes = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
+        let row = (0..<200).map { x in CGFloat(bytes[5 * bitmap.bytesPerRow + x * 4 + 3]) / 255 }
+        return { x in row[x] }
+    }
+
+    func testPatternCellsPastTheDrawingsBudgetPaintTheirAverageColour() throws {
+        // a new CGPattern per square, each cell 2 commands and 100 pixels: 900 of a budget of 64 × 100
+        let alpha = try renderSquaresUnderTransforms(maxFilterLayerPixels: 100, current: false)
+        XCTAssertEqual(alpha(2), 1, accuracy: 0.01)
+        XCTAssertEqual(alpha(7), 0, accuracy: 0.01)
+        XCTAssertEqual(alpha(192), 0.5, accuracy: 0.02)
+        XCTAssertEqual(alpha(197), 0.5, accuracy: 0.02)
+    }
+
+    func testPatternCellsTiledPastTheDrawingsBudgetPaintTheirAverageColour() throws {
+        // where AppKit draws, the cells are tiled by hand: one per square, 6 commands each
+        let alpha = try renderSquaresUnderTransforms(maxFilterLayerPixels: 100, current: true)
+        XCTAssertEqual(alpha(2), 1, accuracy: 0.01)
+        XCTAssertEqual(alpha(7), 0, accuracy: 0.01)
+        XCTAssertEqual(alpha(192), 0.5, accuracy: 0.02)
+        XCTAssertEqual(alpha(197), 0.5, accuracy: 0.02)
+        // and all tiled within a full budget
+        let full = try renderSquaresUnderTransforms(maxFilterLayerPixels: CGRenderer.defaultMaxFilterLayerPixels, current: true)
+        XCTAssertEqual(full(192), 1, accuracy: 0.01)
+        XCTAssertEqual(full(197), 0, accuracy: 0.01)
+    }
+}
+
+extension CGPatternTests.Pixel {
+    // premultiplied RGBA bytes, opaque colours only
+    init(_ p: UnsafePointer<UInt8>) {
+        self.init(red: CGFloat(p[0]) / 255, green: CGFloat(p[1]) / 255, blue: CGFloat(p[2]) / 255, alpha: CGFloat(p[3]) / 255)
+    }
+
+    init(red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat) {
+        // loose: a view's colours are matched to the display's space and read back converted
+        guard alpha > 0.9 else { self = .other; return }
+        if red > 0.8, green < 0.3, blue < 0.3 { self = .red }
+        else if red < 0.3, green < 0.3, blue > 0.8 { self = .blue }
+        else { self = .other }
+    }
+}
+
+extension CGPatternTests {
+
     enum Pixel: Equatable {
         case red
+        case blue
         case white
         case other
     }

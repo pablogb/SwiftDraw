@@ -92,6 +92,42 @@ final class CGPathSegmentTests: XCTestCase {
     XCTAssertEqual(done.wait(timeout: .now() + 20), .success)
     XCTAssertGreaterThan(path?.boundingBox.width ?? 0, 20_000 * 10)
   }
+
+  /// `segments` lines between pseudo-random points within `size`
+  static func scribble(segments: Int, size: CGFloat = 100) -> CGPath {
+    var seed: UInt64 = 1
+    func next() -> CGFloat {
+      seed = seed &* 6364136223846793005 &+ 1442695040888963407
+      return CGFloat(seed >> 33) / CGFloat(1 << 31) * size
+    }
+    let path = CGMutablePath()
+    path.move(to: .zero)
+    for _ in 0..<segments {
+      path.addLine(to: CGPoint(x: next(), y: next()))
+    }
+    return path
+  }
+
+  func testRasterCostCountsCrossingsAndCrowdedRows() {
+    // measured: 1.7 s, 2.1 s and 0.15 s to fill on a bitmap
+    let scribble = Self.scribble(segments: 2_000)
+    XCTAssertGreaterThan(scribble.rasterCost(transform: .identity), 1_000_000_000)
+    let tinyText = String(repeating: "W", count: 1_000).toPath(font: CTFontCreateWithName("Times" as CFString, 1, nil))!
+    XCTAssertGreaterThan(tinyText.rasterCost(transform: .identity), 1_000_000_000)
+    let line = String(repeating: "The quick brown fox jumps over the lazy dog. ", count: 2)
+      .toPath(font: CTFontCreateWithName("Times" as CFString, 12, nil))!
+    let page = CGMutablePath()
+    for row in 0..<50 {
+      page.addPath(line, transform: CGAffineTransform(translationX: 0, y: CGFloat(row) * 14))
+    }
+    XCTAssertLessThan(page.rasterCost(transform: .identity), 400_000_000)
+
+    // cost does not depend on scale or position, but on which way the rows run
+    let scaled = CGAffineTransform(a: 4, b: 0, c: 0, d: 4, tx: 100, ty: 100)
+    XCTAssertEqual(scribble.rasterCost(transform: scaled), scribble.rasterCost(transform: .identity))
+    // a few edges cost nothing worth counting
+    XCTAssertEqual(Self.scribble(segments: 10).rasterCost(transform: .identity), 0)
+  }
 }
 
 #endif

@@ -237,10 +237,76 @@ final class CGClipMaskTests: XCTestCase {
         XCTAssertLessThan(spent, 40 * 40 * 18)
     }
 
+    func testSoftMaskCompositesTheGroupOnceInPDF() throws {
+        // a red square under a blue band, faded by a gradient: half way, the band hides the red under it
+        let color = try renderPDFColor(#"""
+            <linearGradient id="fade" x1="0" x2="1"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#000"/></linearGradient>
+            <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="16" height="16"><rect width="16" height="16" fill="url(#fade)"/></mask>
+            <g mask="url(#m)"><rect width="16" height="16" fill="#f00"/><rect y="4" width="16" height="8" fill="#00f"/></g>
+            """#)
+        // through the mask one shape at a time, the red showed: (128, 64, 192). CoreGraphics' reader
+        // composites the group in Generic RGB: about (138, 160, 250) where (128, 128, 255) is exact
+        let band = color(8, 8)
+        XCTAssertLessThan(Int(band.red) - Int(band.green), 16)
+        XCTAssertGreaterThan(band.blue, 200)
+        let red = color(8, 2)
+        XCTAssertGreaterThan(red.red, 200)
+        XCTAssertGreaterThan(Int(red.red) - Int(red.green), 60)
+    }
+
+    func testMaskImageCoversOnlyTheMaskedContents() throws {
+        // a page-sized mask on a 6 pt square: rasterized around the square, not the page
+        let svg = try XCTUnwrap(SVG(xml: #"""
+        <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000">
+            <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="1000" height="1000"><rect width="1000" height="1000" fill="white"/></mask>
+            <rect x="500" y="500" width="6" height="6" fill="red" mask="url(#m)" />
+        </svg>
+        """#))
+        let data = NSMutableData()
+        var box = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+        let ctx = try XCTUnwrap(CGContext(consumer: try XCTUnwrap(CGDataConsumer(data: data as CFMutableData)), mediaBox: &box, nil))
+        ctx.beginPDFPage(nil)
+        let renderer = CGRenderer(context: ctx)
+        renderer.perform(svg.commands)
+        ctx.endPDFPage()
+        ctx.closePDF()
+        // a probe and an image of 6 pt at 300 ppi, 25 × 25 pixels each
+        XCTAssertGreaterThanOrEqual(renderer.filterLayers.spentPasses, 2 * 25 * 25)
+        XCTAssertLessThan(renderer.filterLayers.spentPasses, 2 * 30 * 30)
+    }
+
+    func testMaskedStrokeIsKeptWhereTheFillIsNot() throws {
+        // the transparency layer covers the contents with their stroke
+        let colors = try render(#"""
+            <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="16" height="16"><rect width="16" height="16" fill="white"/></mask>
+            <rect x="5" y="5" width="6" height="6" fill="red" stroke="red" stroke-width="6" mask="url(#m)" />
+            """#)
+        XCTAssertEqual(colors(3), .red)
+        XCTAssertEqual(colors(12), .red)
+        XCTAssertEqual(colors(0), .white)
+    }
+
     enum Pixel: Equatable {
         case red
         case white
         case other
+    }
+
+    /// The PDF drawn on white at 4 px per point; the colour at the centre of point (x, y), y down.
+    func renderPDFColor(_ body: String) throws -> (Int, Int) -> (red: UInt8, green: UInt8, blue: UInt8) {
+        let page = try XCTUnwrap(CGPDFDocument(CGDataProvider(data: try makePDF(body) as CFData)!)?.page(at: 1))
+        let canvas = try XCTUnwrap(CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 64 * 4,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        canvas.setFillColor(.white)
+        canvas.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+        canvas.scaleBy(x: 4, y: 4)
+        canvas.drawPDFPage(page)
+        let data = Array(UnsafeBufferPointer(start: try XCTUnwrap(canvas.data).assumingMemoryBound(to: UInt8.self), count: 64 * 64 * 4))
+        return { x, y in
+            let i = (y * 4 + 2) * 64 * 4 + (x * 4 + 2) * 4
+            return (data[i], data[i + 1], data[i + 2])
+        }
     }
 
     func makePDF(_ body: String) throws -> Data {

@@ -129,8 +129,9 @@ final class RendererCGTextTests: XCTestCase {
         </svg>
         """#
         let code = try CGTextRenderer.render(data: Data(svg.utf8), options: .default, api: .uiKit, precision: 2)
-        XCTAssertTrue(code.contains("bounds: CGRect(x: 2, y: 3, width: 8, height: 8)"))
-        XCTAssertTrue(code.contains("matrix: CGAffineTransform(a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 10.0, ty: 0.0).concatenating(ctx.ctm.concatenating(baseCTM.inverted()))"))
+        // the cell in the contents' space: the tile's offset joins the patternTransform
+        XCTAssertTrue(code.contains("bounds: CGRect(x: 0, y: 0, width: 8, height: 8)"))
+        XCTAssertTrue(code.contains("matrix: CGAffineTransform(a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 12.0, ty: 3.0).concatenating(ctx.ctm.concatenating(baseCTM.inverted()))"))
     }
 
     func testSwiftUICode() throws {

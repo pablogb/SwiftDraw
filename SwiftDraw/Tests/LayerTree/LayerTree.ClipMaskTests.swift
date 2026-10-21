@@ -479,6 +479,56 @@ final class LayerTreeClipMaskTests: XCTestCase {
         XCTAssertEqual(fills(c).count, count)
     }
 
+    func testClipPathIsResolvedOncePerIdAndBox() throws {
+        let svg = try DOM.SVG.parse(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        <clipPath id="user"><rect width="50" height="50"/></clipPath>
+        <clipPath id="box" clipPathUnits="objectBoundingBox"><rect width="0.5" height="0.5"/></clipPath>
+        \(String(repeating: ##"<rect width="10" height="10" clip-path="url(#user)"/>"##, count: 50))
+        \(String(repeating: ##"<rect width="10" height="10" clip-path="url(#box)"/><rect width="20" height="20" clip-path="url(#box)"/>"##, count: 50))
+        </svg>
+        """)
+        let builder = LayerTree.Builder(svg: svg)
+        _ = builder.makeLayer()
+        XCTAssertEqual(builder.resolved.clips.count, 3)
+        XCTAssertEqual(builder.references.elements, 150)
+    }
+
+    func testBoundingBoxClipNestedInAUserSpaceClipFollowsEachElement() throws {
+        let c = try commands("""
+        <clipPath id="half" clipPathUnits="objectBoundingBox"><rect width="0.5" height="1"/></clipPath>
+        <clipPath id="page" clip-path="url(#half)"><rect width="100" height="100"/></clipPath>
+        <rect width="10" height="10" clip-path="url(#page)"/>
+        <rect width="40" height="10" clip-path="url(#page)"/>
+        """)
+        XCTAssertEqual(clips(c).map(\.bounds.width), [5, 100, 20, 100])
+    }
+
+    func testClipPathMembersSpendTheBudgetPerElementClipped() throws {
+        // each element clipped draws the 1000 members again: past the budget, elements are clipped away
+        let members = (0..<1_000).map { ##"<rect x="\##($0 % 100)" y="\##($0 / 100)" width="0.5" height="0.5"/>"## }.joined()
+        let svg = try DOM.SVG.parse(xml: """
+        <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        <clipPath id="c">\(members)</clipPath>
+        \(String(repeating: ##"<rect width="100" height="100" clip-path="url(#c)"/>"##, count: 1_000))
+        </svg>
+        """)
+        let builder = LayerTree.Builder(svg: svg)
+        let layer = builder.makeLayer()
+        let clips = layer.contents.compactMap { contents -> Int? in
+            guard case .layer(let l) = contents else { return nil }
+            return l.clip.count
+        }
+        let budget = LayerTree.Builder.ReferenceGuard.maxElements / 1_000
+        XCTAssertEqual(clips.count, 1_000)
+        XCTAssertEqual(clips.filter { $0 == 1_000 }.count, budget)
+        XCTAssertEqual(clips.filter { $0 == 1 }.count, 1_000 - budget)
+        XCTAssertEqual(layer.contents.compactMap { contents -> LayerTree.ClipShape? in
+            guard case .layer(let l) = contents, l.clip.count == 1 else { return nil }
+            return l.clip[0]
+        }.allSatisfy { $0 == .empty }, true)
+    }
+
     func testGroupWithTextHasUnknownBoundingBox() throws {
         // a bbox measured without the text would cut it away: the region and the bbox clip are skipped
         let svg = try DOM.SVG.parse(xml: """

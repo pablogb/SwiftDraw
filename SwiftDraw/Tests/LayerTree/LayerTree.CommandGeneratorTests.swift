@@ -190,8 +190,9 @@ final class LayerTreeCommandGeneratorTests: XCTestCase {
         }
         // the pattern without width/height paints nothing, and the document still renders
         XCTAssertEqual(patterns.count, 1)
-        XCTAssertEqual(patterns.first?.frame, .init(x: 2, y: 3, width: 8, height: 8))
-        XCTAssertEqual(patterns.first?.transform, .init(a: 1, b: 0, c: 0, d: 1, tx: 10, ty: 0))
+        // the cell in the contents' space: the tile's offset joins the patternTransform
+        XCTAssertEqual(patterns.first?.frame, .init(x: 0, y: 0, width: 8, height: 8))
+        XCTAssertEqual(patterns.first?.transform, .init(a: 1, b: 0, c: 0, d: 1, tx: 12, ty: 3))
         XCTAssertEqual(patterns.first?.contents.count, 1)
         XCTAssertEqual(commands.filter { if case .fill = $0 { return true } else { return false } }.count, 1)
     }

@@ -75,9 +75,12 @@ extension LayerTree.FilterLayer {
         var blur: (inout FilterBitmap, Float, Float) -> Void
         // straight (non-premultiplied) RGBA of a colour in the encoding of the bitmaps
         var color: (LayerTree.Color) -> SIMD4<Float> = FilterBitmap.components(of:)
+        // charges the nanoseconds a primitive is about to cost; false stops the evaluation
+        var spend: (Int) -> Bool = { _ in true }
     }
 
     // The result of the last primitive, given SourceGraphic: the layer contents drawn over the filter region.
+    // SourceGraphic itself, unfiltered, when `environment.spend` stops the evaluation.
     func evaluate(source: FilterBitmap, environment: Environment) -> FilterBitmap {
         let width = source.width
         let height = source.height
@@ -122,17 +125,27 @@ extension LayerTree.FilterLayer {
                     environment.blur(&result, deviation.x, deviation.y)
                 case let .offset(dx: dx, dy: dy):
                     let vector = environment.transform.vector(dx, dy)
-                    result = FilterBitmap.offset(input(0), dx: vector.x, dy: vector.y)
+                    let image = input(0)
+                    guard environment.spend(FilterBitmap.cost(of: [image], weight: 20)) else { return source }
+                    result = FilterBitmap.offset(image, dx: vector.x, dy: vector.y)
                 case .flood(let color):
                     result = FilterBitmap.flood(width: width, height: height, color: environment.color(color))
                 case .composite(let op):
-                    result = FilterBitmap.composite(input(0), input(1), op: op, linear: isLinear)
+                    let inputs = [input(0), input(1)]
+                    guard environment.spend(FilterBitmap.cost(of: inputs, weight: 32)) else { return source }
+                    result = FilterBitmap.composite(inputs[0], inputs[1], op: op, linear: isLinear)
                 case .merge:
-                    result = FilterBitmap.merge(primitive.inputs.indices.map(input), width: width, height: height, linear: isLinear)
+                    let inputs = primitive.inputs.indices.map(input)
+                    guard environment.spend(FilterBitmap.cost(of: inputs, weight: 32)) else { return source }
+                    result = FilterBitmap.merge(inputs, width: width, height: height, linear: isLinear)
                 case .blend(let mode):
-                    result = FilterBitmap.blend(input(0), input(1), mode: mode, linear: isLinear)
+                    let inputs = [input(0), input(1)]
+                    guard environment.spend(FilterBitmap.cost(of: inputs, weight: 48)) else { return source }
+                    result = FilterBitmap.blend(inputs[0], inputs[1], mode: mode, linear: isLinear)
                 case .colorMatrix(let matrix):
-                    result = FilterBitmap.colorMatrix(input(0), matrix: matrix, linear: isLinear)
+                    let image = input(0)
+                    guard environment.spend(FilterBitmap.cost(of: [image], weight: 56)) else { return source }
+                    result = FilterBitmap.colorMatrix(image, matrix: matrix, linear: isLinear)
                 }
                 result.clip(to: primitive.subregion, transform: environment.transform)
             }
@@ -518,6 +531,49 @@ extension FilterBitmap {
 // MARK: - Pixel access
 
 private extension FilterBitmap {
+
+    // About what combining the inputs in turn costs, `weight` ns for each pixel worked out on its own:
+    // one differing from the pixel before in either bitmap (runs are computed once). One input: a map.
+    static func cost(of inputs: [FilterBitmap], weight: Int) -> Int {
+        guard let first = inputs.first else { return 0 }
+        let pixels = first.width * first.height
+        // inputs read from one result share its storage: counted once
+        var counted = [UnsafeRawPointer?: Int]()
+        func changes(of input: FilterBitmap) -> (count: Int, isNew: Bool) {
+            let key = input.pixels.withUnsafeBytes { UnsafeRawPointer($0.baseAddress) }
+            if let count = counted[key] { return (count, false) }
+            let count = input.changes
+            counted[key] = count
+            return (count, true)
+        }
+        var changed = changes(of: first).count
+        guard inputs.count > 1 else { return weight * changed }
+        var cost = 0
+        for input in inputs.dropFirst() {
+            let other = changes(of: input)
+            cost += weight * min(pixels, changed + other.count)
+            if other.isNew {
+                changed = min(pixels, changed + other.count)
+            }
+        }
+        return cost
+    }
+
+    // pixels differing from the pixel before, the first from transparent black
+    var changes: Int {
+        pixels.withUnsafeBytes { buffer in
+            var count = 0
+            var previous: UInt32 = 0
+            var i = 0
+            while i + 4 <= buffer.count {
+                let pixel = buffer.loadUnaligned(fromByteOffset: i, as: UInt32.self)
+                count &+= pixel != previous ? 1 : 0
+                previous = pixel
+                i += 4
+            }
+            return count
+        }
+    }
 
     // Runs of equal pixels (transparent areas, solid fills) are computed once.
     static func combine(_ a: FilterBitmap, _ b: FilterBitmap, linear: Bool,

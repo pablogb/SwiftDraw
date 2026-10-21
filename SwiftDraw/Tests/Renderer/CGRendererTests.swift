@@ -181,6 +181,70 @@ final class CGRendererTests: XCTestCase {
     XCTAssertEqual(renderer.getColor(x: 0, y: 0), .red)
     XCTAssertEqual(renderer.getColor(x: 1, y: 1), .red)
   }
+
+  func testPathTooCostlyToRasterizeIsNeitherFilledNorClippedTo() throws {
+    // 3000 edges crossing each other: seconds of antialiasing, more than the drawing's budget
+    let scribble = CGPathSegmentTests.scribble(segments: 3_000)
+    let bitmap = try XCTUnwrap(CGContext(data: nil, width: 100, height: 100, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    let renderer = CGRenderer(context: bitmap)
+    renderer.perform([
+      .setFill(color: CGColor(gray: 0, alpha: 1)),
+      .fill(CGPath(rect: CGRect(x: 0, y: 0, width: 10, height: 10), transform: nil), rule: .winding),
+      .fill(scribble, rule: .winding),
+      .pushState,
+      .setClip(path: scribble, rule: .winding),
+      .fill(CGPath(rect: CGRect(x: 0, y: 0, width: 100, height: 100), transform: nil), rule: .winding),
+      .popState
+    ])
+    let data = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
+    let drawn = (0..<100).flatMap { y in (0..<100).map { x in data[y * bitmap.bytesPerRow + x * 4 + 3] } }.filter { $0 != 0 }
+    // only the square
+    XCTAssertEqual(drawn.count, 100)
+    XCTAssertEqual(renderer.filterLayers.spentPasses, 0)
+
+    // a PDF writes it out
+    let pdfData = NSMutableData()
+    var box = CGRect(x: 0, y: 0, width: 100, height: 100)
+    let pdf = try XCTUnwrap(CGContext(consumer: try XCTUnwrap(CGDataConsumer(data: pdfData as CFMutableData)), mediaBox: &box, nil))
+    pdf.beginPDFPage(nil)
+    CGRenderer(context: pdf).perform([.setFill(color: CGColor(gray: 0, alpha: 1)), .fill(scribble, rule: .winding)])
+    pdf.endPDFPage()
+    pdf.closePDF()
+    XCTAssertGreaterThan(pdfData.length, 3_000 * 8)
+  }
+
+  func testWideStrokesPastTheBudgetAreNotDrawn() throws {
+    // 3000 crossing edges stroked 4 px wide: about 0.1 s each, so 20 copies are more than the drawing's budget
+    let scribble = CGPathSegmentTests.scribble(segments: 3_000)
+    let bitmap = try XCTUnwrap(CGContext(data: nil, width: 2_000, height: 100, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    var commands: [RendererCommand<CGTypes>] = [.setStroke(color: CGColor(gray: 0, alpha: 1)), .setLine(width: 4)]
+    for copy in 0..<20 {
+      commands += [.pushState, .translate(tx: CGFloat(copy) * 100, ty: 0), .stroke(scribble), .popState]
+    }
+    CGRenderer(context: bitmap).perform(commands)
+    let data = try XCTUnwrap(bitmap.data).assumingMemoryBound(to: UInt8.self)
+    func isDrawn(_ copy: Int) -> Bool {
+      (0..<100).contains { y in (copy * 100..<copy * 100 + 100).contains { x in data[y * bitmap.bytesPerRow + x * 4 + 3] != 0 } }
+    }
+    XCTAssertTrue(isDrawn(0))
+    XCTAssertFalse(isDrawn(19))
+  }
+
+  func testTextIsLaidOutOncePerStringAndPlace() {
+    let generator = LayerTree.CommandGenerator(provider: CGProvider(), size: .init(100, 100), options: .default)
+    let attributes = LayerTree.TextAttributes(color: .gray(white: 0, a: 1), font: [.name("Times")], size: 12,
+                                              anchor: .start, baseline: .auto)
+    let layer = LayerTree.Layer()
+    layer.contents = [.text("Hello", .init(0, 10), attributes), .text("Hello", .init(0, 10), attributes)]
+    let paths = generator.renderCommands(for: layer, colorConverter: .default).compactMap { command -> CGPath? in
+      guard case .fill(let path, _) = command else { return nil }
+      return path
+    }
+    XCTAssertEqual(paths.count, 2)
+    XCTAssertTrue(paths[0] === paths[1])
+  }
 }
 
 final class ImageRenderer {

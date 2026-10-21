@@ -42,6 +42,7 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
         var shapes = 0
         var maskedLayers = 0
         var patternFills = 0
+        var texts = 0
         var nesting = 0
     }
 
@@ -85,7 +86,9 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
                     stats.patternFills += 1
                     collect(pattern.contents, depth: depth + 1, into: &stats)
                 }
-            case .image, .text:
+            case .text:
+                stats.texts += 1
+            case .image:
                 break
             }
         }
@@ -193,6 +196,34 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
         XCTAssertGreaterThan(s.shapes, budget * 9 / 10)
     }
 
+    func testHeavyCopiesSpendTheBudgetByTheirSize() throws {
+        // 10 000 copies of an 800-segment path: each costs 101 elements
+        let path = ##"<path id="l0" d="M0 0"## + String(repeating: " L1 1", count: 800) + ##""/>"##
+        var body = "<defs>" + path
+        for i in 1...4 {
+            body += ##"<g id="l\##(i)">"## + String(repeating: ##"<use xlink:href="#l\##(i - 1)"/>"##, count: 10) + "</g>"
+        }
+        body += ##"</defs><use xlink:href="#l4"/>"##
+        let builder = LayerTree.Builder(svg: try makeSVG(body))
+        let s = Self.stats(of: builder.makeLayer())
+        let copies = LayerTree.Builder.ReferenceGuard.maxElements / 101
+        XCTAssertLessThanOrEqual(s.shapes, copies)
+        XCTAssertGreaterThan(s.shapes, copies * 9 / 10)
+    }
+
+    func testTextCopiesSpendTheBudgetByTheirLength() throws {
+        // 1000 copies of 100 characters: each costs 1001 elements
+        var body = ##"<defs><text id="l0">"## + String(repeating: "W", count: 100) + "</text>"
+        for i in 1...3 {
+            body += ##"<g id="l\##(i)">"## + String(repeating: ##"<use xlink:href="#l\##(i - 1)"/>"##, count: 10) + "</g>"
+        }
+        body += ##"</defs><use xlink:href="#l3"/>"##
+        let s = try stats(body)
+        let copies = LayerTree.Builder.ReferenceGuard.maxElements / 1001
+        XCTAssertLessThanOrEqual(s.texts, copies)
+        XCTAssertGreaterThan(s.texts, copies * 9 / 10)
+    }
+
     func testManyUsesOfOneShapeAllDraw() throws {
         // text exported as glyph <use>s: 25 600 copies, far below the element budget
         let uses = String(repeating: ##"<use xlink:href="#d"/>"##, count: 25_600)
@@ -295,7 +326,36 @@ final class LayerTreeBuilderReferenceCycleTests: XCTestCase {
         XCTAssertLessThanOrEqual(s.nesting, LayerTree.Builder.ReferenceGuard.maxDepth + 1)
     }
 
-    // MARK: - mask, pattern, gradient
+    /// `<clipPath id="c0">` ... `<clipPath id="c<count - 1>">`, each clipped by the one before; `member` is each one's child
+    private static func clipChain(count: Int, member: String = ##"<rect width="100" height="100"/>"##) -> String {
+        var svg = ##"<clipPath id="c0">\##(member)</clipPath>"##
+        for i in 1..<count {
+            svg += ##"<clipPath id="c\##(i)" clip-path="url(#c\##(i - 1))">\##(member)</clipPath>"##
+        }
+        return svg
+    }
+
+    func testClipPathIntersectionsCountInTheDepth() throws {
+        // each group is held by 15 layers intersecting the nested clip paths
+        let groups = 190
+        let body = "<defs>\(Self.clipChain(count: 16))</defs>"
+            + String(repeating: ##"<g clip-path="url(#c15)">"##, count: groups) + ##"<rect width="10" height="10"/>"##
+            + String(repeating: "</g>", count: groups)
+        let s = try drawOnSmallStack(body)
+        XCTAssertEqual(s.shapes, 0)
+        XCTAssertLessThanOrEqual(s.nesting, LayerTree.Builder.ReferenceGuard.maxDepth + ActiveClipSet.maxDepth)
+    }
+
+    func testClipPathMasksInDeepGroupsFitTheStack() throws {
+        // text makes every clip path of the chain a mask, hanging from each of 190 groups
+        let groups = 190
+        let body = "<defs>\(Self.clipChain(count: 16, member: "<text>Clip</text>"))</defs>"
+            + String(repeating: ##"<g clip-path="url(#c15)">"##, count: groups) + ##"<rect width="10" height="10"/>"##
+            + String(repeating: "</g>", count: groups)
+        let s = try drawOnSmallStack(body)
+        XCTAssertEqual(s.shapes, 1)
+        XCTAssertEqual(s.maskedLayers, groups * 16)
+    }
 
     func testPatternIsBuiltOncePerId() throws {
         let rects = String(repeating: ##"<rect width="10" height="10" fill="url(#p)"/>"##, count: 100)

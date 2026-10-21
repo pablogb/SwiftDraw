@@ -43,6 +43,12 @@ extension LayerTree.Builder {
         /// Geometry one clipping path cannot express (text, mixed clip-rules, a `clip-path` on the
         /// `<clipPath>` itself): drawn opaque white and applied as an alpha mask.
         case mask(LayerTree.Layer)
+
+        /// The layers `apply` places around the clipped layer.
+        var wrappers: Int {
+            guard case .intersection(_, _, let nested) = self else { return 0 }
+            return 1 + nested.wrappers
+        }
     }
 
     /// A shape or text inside a `<clipPath>`, with the transform from its own coordinates to the
@@ -62,8 +68,39 @@ extension LayerTree.Builder {
     }
 
     /// `bounds` is the bounding box of the referencing element, evaluated only for objectBoundingBox units.
+    /// Resolved once per clip path and box; each element it clips pays for drawing its members again,
+    /// and past the document-wide budget is clipped away.
     func makeClip(id: String, bounds: () -> LayerTree.Rect?) -> Clip? {
-        guard let clip = svg.defs.clipPaths.first(where: { $0.id == id }) else { return nil }
+        // within a clip path being resolved, a cycle or the nesting cap depends on the path taken there
+        guard activeClips.count == 0 else { return resolveClip(id: id, bounds: bounds) }
+        // the box is part of the key when resolving the clip path (or one it uses) measured the element
+        var measured = resolved.clipsMeasuringBounds.contains(id)
+        var box = measured ? bounds() : nil
+        var key: [AnyHashable] = measured ? [id, box] : [id]
+        let resolution = resolved.clips[key] ?? {
+            resolved.clipCost = 0
+            let clip = resolveClip(id: id, bounds: {
+                if !measured {
+                    measured = true
+                    box = bounds()
+                }
+                return box
+            })
+            if measured {
+                resolved.clipsMeasuringBounds.insert(id)
+                key = [id, box]
+            }
+            return (clip, resolved.clipCost)
+        }()
+        resolved.clips[key] = resolution
+        guard resolution.clip != nil, references.spend(resolution.cost) else {
+            return resolution.clip.map { _ in .shapes([.empty], .nonzero) }
+        }
+        return resolution.clip
+    }
+
+    private func resolveClip(id: String, bounds: () -> LayerTree.Rect?) -> Clip? {
+        guard let clip = resolved.clipPath(id: id, in: svg.defs) else { return nil }
 
         // a clip path that (indirectly) clips itself is ignored; the active set is not counted
         // against the document-wide reference budget, so any number of elements may share a clip.
@@ -92,6 +129,7 @@ extension LayerTree.Builder {
         // `visibility` is inherited: a hidden <clipPath> hides its children unless they say `visible`
         let visibility = own.visibility ?? .visible
         let members = clip.childElements.flatMap { makeClipMembers(for: $0, inheriting: rule, visibility: visibility) }
+        resolved.clipCost += members.reduce(0) { $0 + ReferenceGuard.cost(of: $1.element) }
         let nested = own.clipPath?.fragmentID
 
         let shapes = members.compactMap { member -> LayerTree.ClipShape? in
@@ -424,5 +462,14 @@ extension LayerTree.Rect {
         let maxX = Swift.max(x + width, other.x + other.width)
         let maxY = Swift.max(y + height, other.y + other.height)
         return LayerTree.Rect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// Empty when the rects do not meet.
+    func intersection(_ other: LayerTree.Rect) -> LayerTree.Rect {
+        let minX = Swift.max(x, other.x)
+        let minY = Swift.max(y, other.y)
+        let maxX = Swift.min(x + width, other.x + other.width)
+        let maxY = Swift.min(y + height, other.y + other.height)
+        return LayerTree.Rect(x: minX, y: minY, width: Swift.max(0, maxX - minX), height: Swift.max(0, maxY - minY))
     }
 }

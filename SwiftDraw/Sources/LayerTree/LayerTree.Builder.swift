@@ -187,7 +187,7 @@ extension LayerTree {
             var resultLayer: Layer? = nil
 
             while let (currentElement, currentState, parentLayer, currentAncestors, depth) = stack.popLast() {
-                guard references.spend(atDepth: depth) else {
+                guard references.spend(atDepth: depth, cost: ReferenceGuard.cost(of: currentElement)) else {
                     if parentLayer == nil {
                         resultLayer = Layer()
                     }
@@ -206,6 +206,7 @@ extension LayerTree {
                     continue
                 }
                 let (layer, placed) = makeBaseLayer(from: currentElement, attributes: attributes, with: newState)
+                let childDepth = references.level
                 var childAncestors = currentAncestors
                 if let id = currentElement.id {
                     childAncestors.append(id)
@@ -216,12 +217,12 @@ extension LayerTree {
                 } else if let sw = currentElement as? DOM.Switch {
                     //TODO: select first element that creates non empty Layer
                     if let first = sw.childElements.first {
-                        stack.append((first, newState, layer, childAncestors, depth + 1))
+                        stack.append((first, newState, layer, childAncestors, childDepth))
                     }
                 } else if let container = currentElement as? any ContainerElement {
                     // Push children in reverse so they are processed in the original order
                     for child in container.childElements.reversed() {
-                        stack.append((child, newState, layer, childAncestors, depth + 1))
+                        stack.append((child, newState, layer, childAncestors, childDepth))
                     }
                 }
 
@@ -255,19 +256,18 @@ extension LayerTree {
         }
 
         /// The element's layer, which receives its contents, and the layer placed in its parent: the
-        /// same layer, or the layers holding it that intersect a nested `clip-path`.
+        /// same layer, or the layers holding it that intersect a nested `clip-path`. Those layers nest
+        /// the element's mask and contents deeper: `references.level` is raised by their number.
         func makeBaseLayer(from element: DOM.GraphicsElement, attributes: DOM.PresentationAttributes, with state: State) -> (layer: Layer, placed: Layer) {
             let l = Layer()
             l.class = element.class
             l.transform = Builder.createTransforms(from: attributes.transform ?? [])
-            l.mask = createMaskLayer(for: element, attributes: attributes)
-            var placed = l
             // clip-rule comes from the <clipPath> contents and objectBoundingBox units are resolved
             // here, so every clip reaches the renderers in user space (SVG 1.1 §14.3.5)
-            if let clipID = attributes.clipPath?.fragmentID,
-               let clip = makeClip(id: clipID, bounds: { makeBoundingBox(for: element) }) {
-                placed = apply(clip, to: l)
-            }
+            let clip = attributes.clipPath?.fragmentID.flatMap { makeClip(id: $0, bounds: { makeBoundingBox(for: element) }) }
+            references.level += clip?.wrappers ?? 0
+            l.mask = createMaskLayer(for: element, attributes: attributes)
+            let placed = clip.map { apply($0, to: l) } ?? l
             l.opacity = state.opacity
             if let filter = makeFilter(attributes: attributes) {
                 l.filters = filter.primitives
@@ -588,13 +588,28 @@ extension LayerTree.Builder {
         return paint
     }
 
-    /// Paint servers and filters resolved once per id.
+    /// Paint servers, filters and clip paths resolved once per id.
     final class ResolvedDefs {
         var paints = [String: GradientPaint?]()
         /// with the depth it was built at: its contents fit under `ReferenceGuard.maxDepth` from there or above
         var patterns = [String: (pattern: LayerTree.Pattern, level: Int)]()
         var filters = [String: (primitives: [LayerTree.FilterPrimitive], region: LayerTree.FilterRegion)?]()
+        /// by id, and by bounding box for those in `clipsMeasuringBounds`, with what drawing one costs
+        var clips = [[AnyHashable]: (clip: Clip?, cost: Int)]()
+        var clipsMeasuringBounds = Set<String>()
+        /// the members of the clip paths resolved since it was reset
+        var clipCost = 0
         private var index: [String: GradientElement]?
+        private var clipPaths: [String: DOM.ClipPath]?
+
+        /// The first clip path with the id, found without a scan per element clipped.
+        func clipPath(id: String, in defs: DOM.SVG.Defs) -> DOM.ClipPath? {
+            if let clipPaths { return clipPaths[id] }
+            var clipPaths = [String: DOM.ClipPath]()
+            for clipPath in defs.clipPaths.reversed() { clipPaths[clipPath.id] = clipPath }
+            self.clipPaths = clipPaths
+            return clipPaths[id]
+        }
 
         /// Every gradient by id, built once (a linear gradient wins over a radial one with the same id,
         /// the first of its kind over later ones), so each href hop is a lookup, not a scan of the defs.
@@ -1042,14 +1057,16 @@ extension LayerTree.Builder {
     /// Bounds the layer tree built from a document. A reference already being resolved is refused.
     ///
     /// `maxDepth` caps nesting document-wide, `<use>`, mask and pattern contents continuing the depth
-    /// of the element that references them: building, drawing and releasing the tree recurse per level,
+    /// of the element that references them, and each layer intersecting a nested `clip-path` counting
+    /// one level: building, drawing and releasing the tree recurse per level,
     /// and Backdrop renders on 512 KB secondary threads. Entering a reference counts `referenceDepth`
     /// levels: it recurses natively through the builder, about 6 KB of stack (10 KB in debug builds),
     /// where a group level costs well under 1 KB, only when the tree is released.
     ///
-    /// `maxElements` caps the elements built inside `<use>`, mask and pattern contents, each costing one:
-    /// once it is spent their expansion stops (non-cyclic fan-out such as 10 uses of 10 uses is
-    /// exponential). The document's own elements, bounded by its size, are always built.
+    /// `maxElements` caps the cost of the elements built inside `<use>`, mask and pattern contents: once
+    /// it is spent their expansion stops (non-cyclic fan-out such as 10 uses of 10 uses is exponential).
+    /// An element costs one, about 5 µs to build, generate and draw, plus its size (`cost(of:)`). The
+    /// document's own elements, bounded by its size, are always built.
     ///
     /// Any new walk over a reference chain that re-enters `<use>`, mask or pattern expansion must call this.
     /// Gradient and pattern `href` chains do not: they are bounded by `maxGradientHops`.
@@ -1075,13 +1092,35 @@ extension LayerTree.Builder {
             level -= Self.referenceDepth
         }
 
-        /// Counts an element inside a reference; false when it is too deep, or the budget is spent.
-        func spend(atDepth depth: Int) -> Bool {
+        /// Counts an element inside a reference; false when it is too deep, or the budget cannot pay it.
+        func spend(atDepth depth: Int, cost: @autoclosure () -> Int = 1) -> Bool {
             guard depth < Self.maxDepth else { return false }
-            guard !active.isEmpty else { return true }
-            guard elements < Self.maxElements else { return false }
-            elements += 1
+            return active.isEmpty || spend(cost())
+        }
+
+        /// Counts `cost` inside a reference or not; false when the budget cannot pay it.
+        func spend(_ cost: Int) -> Bool {
+            guard cost <= Self.maxElements - elements else { return false }
+            elements += cost
             return true
+        }
+
+        /// What a copy of `element` costs, in elements: one, plus about 0.5 µs per path segment or point
+        /// (written out per copy in PDF), 50 µs per character (laid out per copy; a glyph outline written
+        /// to PDF) and 1 µs per KB of image data (decoded per copy).
+        static func cost(of element: DOM.GraphicsElement) -> Int {
+            if let path = element as? DOM.Path {
+                return 1 + path.segments.count / 8
+            } else if let polyline = element as? DOM.Polyline {
+                return 1 + polyline.points.count / 8
+            } else if let polygon = element as? DOM.Polygon {
+                return 1 + polygon.points.count / 8
+            } else if let text = element as? DOM.Text {
+                return 1 + text.value.utf16.count * 10
+            } else if let image = element as? DOM.Image {
+                return 1 + image.href.absoluteString.utf8.count / 4096
+            }
+            return 1
         }
     }
 

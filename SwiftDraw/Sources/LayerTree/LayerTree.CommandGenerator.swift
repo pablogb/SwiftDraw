@@ -48,7 +48,11 @@ extension LayerTree {
         private var hasLoggedSpreadWarning = false
 
         private var paths: [LayerTree.Shape: P.Types.Path] = [:]
+        private var clipPaths: [[AnyHashable]: (shapes: [ClipShape], path: P.Types.Path)] = [:]
+        // text laid out once per string, position and attributes, as shapes are
+        private var texts: [[AnyHashable]: P.Types.Path?] = [:]
         private var images: [LayerTree.Image: P.Types.Image] = [:]
+        private var coverages: [ObjectIdentifier: LayerTree.Rect?] = [:]
         // a pattern's contents by pattern, content transform and colour converter: drawn once, not per shape
         private var patterns: [[AnyHashable]: [RendererCommand<P.Types>]] = [:]
 
@@ -94,7 +98,7 @@ extension LayerTree {
                     commands.append(contentsOf: renderCommands(forClip: layer.clip, using: layer.clipRule))
 
                     if let mask = state.mask {
-                        commands.append(.pushMask(mask))
+                        commands.append(.pushMask(mask, bounds: makeCoverage(for: layer).map(provider.createRect)))
                     }
 
                     // filter is applied before clipping, masking and opacity
@@ -229,14 +233,14 @@ extension LayerTree {
                     commands.append(.fill(path, rule: rule))
                 }
             case .pattern(let fillPattern):
-                if let (resolvedPattern, contentTransform) = Self.resolvePattern(fillPattern, in: provider.getBounds(from: shape)) {
-                    let key: [AnyHashable] = [ObjectIdentifier(fillPattern), contentTransform, ObjectIdentifier(type(of: colorConverter))]
-                    let patternCommands = patterns[key] ?? renderCommands(forPattern: resolvedPattern,
-                                                                          contentTransform: contentTransform,
-                                                                          colorConverter: colorConverter)
+                if let (resolvedPattern, contentTransform) = Self.resolvePattern(fillPattern, in: provider.getBounds(from: shape)),
+                   let cell = Self.makeCell(resolvedPattern, contentTransform: contentTransform) {
+                    // the cell is drawn in the contents' own space, so one set of commands serves every shape filled
+                    let key: [AnyHashable] = [ObjectIdentifier(fillPattern), ObjectIdentifier(type(of: colorConverter))]
+                    let patternCommands = patterns[key] ?? renderCommands(forPattern: cell, colorConverter: colorConverter)
                     patterns[key] = patternCommands
 
-                    let pattern = provider.createPattern(from: resolvedPattern, contents: patternCommands)
+                    let pattern = provider.createPattern(from: cell, contents: patternCommands)
                     let rule = provider.createFillRule(from: fill.rule)
                     commands.append(.setFillPattern(pattern))
                     commands.append(.fill(path, rule: rule))
@@ -349,20 +353,8 @@ extension LayerTree {
         }
 
         func renderCommands(forPattern pattern: Pattern,
-                            contentTransform: LayerTree.Transform.Matrix,
                             colorConverter: any ColorConverter) -> [RendererCommand<P.Types>] {
-            var commands = [RendererCommand<P.Types>]()
-            if contentTransform != .identity {
-                commands.append(.pushState)
-                commands.append(.concatenate(transform: provider.createTransform(from: contentTransform)))
-            }
-            for contents in pattern.contents {
-                commands.append(contentsOf: renderCommands(for: contents, colorConverter: colorConverter))
-            }
-            if contentTransform != .identity {
-                commands.append(.popState)
-            }
-            return commands
+            pattern.contents.flatMap { renderCommands(for: $0, colorConverter: colorConverter) }
         }
 
         func renderCommands(forDash stroke: StrokeAttributes) -> [RendererCommand<P.Types>] {
@@ -423,6 +415,16 @@ extension LayerTree {
             return new
         }
 
+        private func makeCachedPath(from text: String, at point: Point, with attributes: TextAttributes) -> P.Types.Path? {
+            let key: [AnyHashable] = [text, point, attributes]
+            if let existing = texts[key] {
+                return existing
+            }
+            let new = provider.createPath(from: text, at: point, with: attributes)
+            texts.updateValue(new, forKey: key)
+            return new
+        }
+
         private func makeCachedImage(from image: Image) -> P.Types.Image? {
             if let existing = images[image] {
                 return existing
@@ -454,7 +456,7 @@ extension LayerTree {
         }
 
         func renderCommands(for text: String, at point: Point, attributes: TextAttributes, colorConverter: any ColorConverter = .default) -> [RendererCommand<P.Types>] {
-            guard let path = provider.createPath(from: text, at: point, with: attributes) else { return [] }
+            guard let path = makeCachedPath(from: text, at: point, with: attributes) else { return [] }
 
             let converted = colorConverter.createColor(from: attributes.color)
             let color = provider.createColor(from: converted)
@@ -496,6 +498,16 @@ extension LayerTree {
 
         func renderCommands(forClip shapes: [ClipShape], using rule: FillRule?) -> [RendererCommand<P.Types>] {
             guard !shapes.isEmpty else { return [] }
+            let rule = provider.createFillRule(from: rule ?? .nonzero)
+            return [.setClip(path: makeCachedPath(from: shapes), rule: rule)]
+        }
+
+        // elements clipped by one <clipPath> share its array of shapes, which compares at once
+        private func makeCachedPath(from shapes: [ClipShape]) -> P.Types.Path {
+            let key: [AnyHashable] = [shapes.count, shapes[0], shapes[shapes.count - 1]]
+            if let cached = clipPaths[key], cached.shapes == shapes {
+                return cached.path
+            }
             let paths = shapes.map { clip in
                 if clip.transform == .identity {
                     return makeCachedPath(from: clip.shape)
@@ -503,15 +515,9 @@ extension LayerTree {
                     return makeCachedPath(from: .path(clip.shape.path.applying(matrix: clip.transform)))
                 }
             }
-
-            let rule = provider.createFillRule(from: rule ?? .nonzero)
-
-            if paths.count == 1 {
-                return [.setClip(path: paths[0], rule: rule)]
-            } else {
-                let clipPath = provider.createPath(from: paths)
-                return [.setClip(path: clipPath, rule: rule)]
-            }
+            let path = paths.count == 1 ? paths[0] : provider.createPath(from: paths)
+            clipPaths[key] = (shapes, path)
+            return path
         }
 
 
@@ -918,6 +924,50 @@ extension LayerTree.CommandGenerator {
         return .makeBounds(between: points)
     }
 
+    // Where a layer's contents can draw, in its own space (after its transform): shapes with their stroke,
+    // sized images, nested layers within their clip or filter region. Nil when unknown, as for text, or
+    // deeper than 32 layers: the walk recurses, and drawing may run on a 512 KB stack.
+    func makeCoverage(for layer: LayerTree.Layer, depth: Int = 0) -> LayerTree.Rect? {
+        guard depth < 32 else { return nil }
+        if let coverage = coverages[ObjectIdentifier(layer)] {
+            return coverage
+        }
+        var coverage: LayerTree.Rect?
+        var isKnown = true
+        func add(_ rect: LayerTree.Rect?) {
+            guard let rect else { return isKnown = false }
+            coverage = coverage.map { $0.union(rect) } ?? rect
+        }
+        for contents in layer.contents where isKnown {
+            switch contents {
+            case let .shape(shape, stroke, _):
+                if case .color(.none) = stroke.color {
+                    add(shape.bounds)
+                } else {
+                    add(shape.bounds?.outset(by: stroke.coverage))
+                }
+            case .image(let image):
+                add(image.width.flatMap { width in
+                    image.height.map { LayerTree.Rect(x: image.origin.x, y: image.origin.y, width: width, height: $0) }
+                })
+            case .text:
+                add(nil)
+            case .layer(let child):
+                var rect = child.filters.isEmpty ? makeCoverage(for: child, depth: depth + 1)
+                    : makeFilterLayer(for: child)?.region ?? makeCoverage(for: child, depth: depth + 1)
+                if let clip = child.clip.compactMap({ $0.shape.bounds?.applying($0.transform) }).reduce(nil, { (union: LayerTree.Rect?, rect) in
+                    union.map { $0.union(rect) } ?? rect
+                }) {
+                    rect = rect.map { $0.intersection(clip) } ?? clip
+                }
+                add(rect?.applying(child.transform.toMatrix()))
+            }
+        }
+        let result = isKnown ? coverage ?? .zero : nil
+        coverages[ObjectIdentifier(layer)] = .some(result)
+        return result
+    }
+
     func logUnsupportedFilters(_ filters: [LayerTree.FilterPrimitive]) {
         guard !hasLoggedFilterWarning else { return }
         let name = filters.map(\.effect.name).joined(separator: ", ")
@@ -1161,6 +1211,22 @@ private extension LayerTree.Rect {
 }
 
 extension LayerTree.CommandGenerator {
+
+    /// The tile in the space of the pattern's contents, which the content transform then the patternTransform
+    /// place: the contents are drawn as they are, so one set of commands serves every shape the pattern fills.
+    /// Nil when the tile cannot be expressed there (a content scale too small to invert).
+    static func makeCell(_ pattern: LayerTree.Pattern, contentTransform c: LayerTree.Transform.Matrix) -> LayerTree.Pattern? {
+        // resolvePattern's content transform only scales and translates
+        let tile = pattern.frame
+        let frame = LayerTree.Rect(x: (tile.x - c.tx) / c.a, y: (tile.y - c.ty) / c.d,
+                                   width: tile.width / c.a, height: tile.height / c.d)
+        guard [frame.x, frame.y, frame.width, frame.height].allSatisfy(\.isFinite),
+              frame.width > 0, frame.height > 0 else { return nil }
+        let cell = LayerTree.Pattern(frame: frame)
+        cell.transform = c.concatenated(pattern.transform)
+        cell.contents = pattern.contents
+        return cell
+    }
 
     /// Resolves a pattern against the bounding box of the element it fills (SVG 1.1 §13.3).
     ///
